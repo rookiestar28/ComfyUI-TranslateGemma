@@ -1,6 +1,10 @@
 # ComfyUI-TranslateGemma
 
-A ComfyUI custom node that translates text (including prompts) using Google's open-weight **TranslateGemma** models.
+<p align="center">
+  <img src="assets/TranslateGemma.png" alt="TranslateGemma" />
+</p>
+
+A ComfyUI integration for TranslateGemma — Google's new open translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
 
 ## Features
 
