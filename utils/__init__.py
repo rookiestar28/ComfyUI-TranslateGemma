@@ -40,6 +40,12 @@ from .context_utils import (
     suggest_max_new_tokens,
     DEFAULT_AUTO_MAX_NEW_TOKENS,
 )
+from .image_preprocess import (
+    preprocess_for_translategemma,
+    save_preprocessed_image,
+    cleanup_temp_image,
+    TRANSLATEGEMMA_VISION_SIZE,
+)
 
 __all__ = [
     "LANGUAGE_MAP",
@@ -72,4 +78,8 @@ __all__ = [
     "DEFAULT_CONTEXT_LIMIT",
     "suggest_max_new_tokens",
     "DEFAULT_AUTO_MAX_NEW_TOKENS",
+    "preprocess_for_translategemma",
+    "save_preprocessed_image",
+    "cleanup_temp_image",
+    "TRANSLATEGEMMA_VISION_SIZE",
 ]

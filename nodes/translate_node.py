@@ -5,6 +5,11 @@ import time
 from typing import Any
 from ..utils.language_utils import get_language_names, get_language_code
 from ..utils.language_detect import detect_source_lang_code
+from ..utils.image_preprocess import (
+    preprocess_for_translategemma,
+    save_preprocessed_image,
+    cleanup_temp_image,
+)
 from ..utils.model_loader import (
     load_model, get_available_models, unload_current_model, 
     cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS
@@ -70,6 +75,18 @@ class TranslateGemmaNode:
                     "forceInput": True,
                     "tooltip": "Optional image input. If connected, the node will translate text found in the image.",
                 }),
+                "image_enhance": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "(TG-025) Apply mild contrast/sharpening to improve small text visibility in images",
+                }),
+                "image_resize_mode": (["letterbox", "processor", "stretch"], {
+                    "default": "letterbox",
+                    "tooltip": "(TG-025) Image preprocessing: letterbox (preserve aspect), processor (official resize to 896×896, may stretch), stretch (force 896×896, may distort).",
+                }),
+                "image_two_pass": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "(TG-025) Two-pass image translation: extract text from image first, then translate extracted text (more accurate, slower).",
+                }),
                 "source_language": (["Auto Detect"] + languages, {
                     "default": "Auto Detect",
                 }),
@@ -119,6 +136,9 @@ class TranslateGemmaNode:
         target_language: str,
         model_size: str,
         image=None,
+        image_enhance: bool = False,
+        image_resize_mode: str = "letterbox",
+        image_two_pass: bool = True,
         source_language: str = "Auto Detect",
         external_text: str = None,
         prompt_mode: str = "auto",
@@ -136,6 +156,10 @@ class TranslateGemmaNode:
             text: Text from the built-in input field
             target_language: Target language name
             model_size: Model size (4B, 12B, 27B)
+            image: Optional image input (TG-025)
+            image_enhance: Apply enhancement for small text in images (TG-025)
+            image_resize_mode: Image preprocessing mode (TG-025)
+            image_two_pass: Two-pass image translation (extract → translate) (TG-025)
             source_language: Source language name or "Auto Detect"
             external_text: Optional external text input (overrides built-in text)
             prompt_mode: Prompt construction mode (auto/structured/plain)
@@ -154,6 +178,9 @@ class TranslateGemmaNode:
                 target_language=target_language,
                 model_size=model_size,
                 source_language=source_language,
+                image_enhance=image_enhance,
+                image_resize_mode=image_resize_mode,
+                image_two_pass=image_two_pass,
                 max_new_tokens=max_new_tokens,
                 max_input_tokens=max_input_tokens,
                 truncate_input=truncate_input,
@@ -410,6 +437,9 @@ class TranslateGemmaNode:
         target_language: str,
         model_size: str,
         source_language: str,
+        image_enhance: bool,
+        image_resize_mode: str,
+        image_two_pass: bool,
         max_new_tokens: int,
         max_input_tokens: int,
         truncate_input: bool,
@@ -420,6 +450,9 @@ class TranslateGemmaNode:
         """
         Translate text found in an image using TranslateGemma multimodal chat template.
 
+        TG-025: Uses 896×896 preprocessing for optimal vision encoder grounding.
+        TG-025: Optional two-pass mode: extract (source→source) then translate extracted text (source→target).
+        
         Ref: `REFERENCE/translategemma4b/README.md` ("Text Extraction and Translation")
         """
         # The official template requires an explicit source_lang_code; OCR-free auto-detect
@@ -457,7 +490,46 @@ class TranslateGemmaNode:
         target_code = get_language_code(target_language)
         source_code = get_language_code(source_language)
 
+        resize_mode = (image_resize_mode or "letterbox").strip().lower()
+        if resize_mode not in {"letterbox", "processor", "stretch"}:
+            print(f"[TranslateGemma] WARNING: Invalid image_resize_mode='{image_resize_mode}', using 'letterbox'")
+            resize_mode = "letterbox"
+
+        # Optional two-pass strategy to reduce hallucinations:
+        # Pass 1: "extract" by translating image from source → source.
+        # Pass 2: translate extracted text via the normal text path.
+        target_code_for_image = target_code
+        if image_two_pass and source_code != target_code:
+            target_code_for_image = source_code
+            if debug:
+                print(
+                    "[TranslateGemma] Image two-pass enabled: "
+                    f"extract_target_lang_code={target_code_for_image}, final_target_lang_code={target_code}"
+                )
+
+        # Important: For image translation, visual tokens are inserted by the processor.
+        # If `max_input_tokens` is too small and truncation is enabled, the image tokens
+        # can be truncated away, causing hallucinated/unrelated outputs.
+        # TranslateGemma model card notes ~2K total input context for image translation.
+        effective_max_input_tokens = max_input_tokens
+        if truncate_input and int(max_input_tokens) < 2048:
+            effective_max_input_tokens = 2048
+            print(
+                "[TranslateGemma] WARNING: max_input_tokens is too low for image translation "
+                f"({max_input_tokens}). Overriding to {effective_max_input_tokens} to avoid truncating visual tokens."
+            )
+
+        # TG-025: Convert ComfyUI image to PIL, then preprocess to 896×896
         pil_image = self._comfy_image_to_pil(image)
+        original_size = pil_image.size
+        
+        preprocessed_image = preprocess_for_translategemma(
+            pil_image=pil_image,
+            target_size=896,
+            enhance=image_enhance,
+            debug=debug,
+            resize_mode=resize_mode,
+        )
 
         repo_id = MODEL_REPOS.get(model_size) or "unknown"
         device = get_device()
@@ -467,11 +539,20 @@ class TranslateGemmaNode:
             f"mode: image | model_size: {model_size} | repo_id: {repo_id} | "
             f"device: {device} | dtype: {dtype} | cache_dir: {cache_dir} | "
             f"user_max_new_tokens: {max_new_tokens} | max_input_tokens: {max_input_tokens} | "
+            f"effective_max_input_tokens: {effective_max_input_tokens} | "
             f"truncate: {truncate_input} | strict_limit: {strict_context_limit} | "
-            f"source_lang_code: {source_code} | target_lang_code: {target_code}"
+            f"source_lang_code: {source_code} | target_lang_code: {target_code} | "
+            f"image_target_lang_code: {target_code_for_image} | "
+            f"image_enhance: {image_enhance} | image_two_pass: {image_two_pass}"
         )
 
-        tmp_path = None
+        # TG-025: Always use url-only path per official examples
+        tmp_path = save_preprocessed_image(
+            pil_image=preprocessed_image,
+            keep_file=debug,  # Keep file for inspection if debug mode
+            debug=debug,
+        )
+        
         try:
             kwargs = dict(
                 tokenize=True,
@@ -480,9 +561,9 @@ class TranslateGemmaNode:
                 return_tensors="pt",
             )
             if truncate_input:
-                kwargs.update(dict(truncation=True, max_length=max_input_tokens))
+                kwargs.update(dict(truncation=True, max_length=effective_max_input_tokens))
 
-            # First try: pass the PIL image directly (some processors support this).
+            # TG-025: Use url-only path (matches official examples)
             messages = [
                 {
                     "role": "user",
@@ -490,23 +571,17 @@ class TranslateGemmaNode:
                         {
                             "type": "image",
                             "source_lang_code": source_code,
-                            "target_lang_code": target_code,
-                            "image": pil_image,
+                            "target_lang_code": target_code_for_image,
+                            "url": tmp_path,
                         }
                     ],
                 }
             ]
-            try:
-                inputs = processor.apply_chat_template(messages, **kwargs)
-            except Exception:
-                # Fallback: save a temporary file and pass a local path via `url`
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                    tmp_path = f.name
-                pil_image.save(tmp_path)
-
-                messages[0]["content"][0].pop("image", None)
-                messages[0]["content"][0]["url"] = tmp_path
-                inputs = processor.apply_chat_template(messages, **kwargs)
+            
+            if debug:
+                print(f"[TranslateGemma] Image path: {tmp_path} (url-only structured)")
+            
+            inputs = processor.apply_chat_template(messages, **kwargs)
 
             # Move tensors to the model device; cast only floating tensors to dtype (e.g. pixel values).
             moved_inputs = {}
@@ -530,12 +605,15 @@ class TranslateGemmaNode:
                         f"[TranslateGemma] (image) max_new_tokens=0 (Auto) -> "
                         f"requested_max_new_tokens={requested_max_new_tokens}"
                     )
+            # Extraction (source→source) should be short; cap to reduce rambling.
+            if image_two_pass and source_code != target_code:
+                requested_max_new_tokens = min(int(requested_max_new_tokens), 256)
 
             limits = compute_effective_limits(
                 tokenizer=tokenizer,
                 input_len=input_len,
                 max_new_tokens=int(requested_max_new_tokens),
-                max_input_tokens=max_input_tokens,
+                max_input_tokens=int(effective_max_input_tokens),
                 strict_context_limit=strict_context_limit,
                 truncate_input=truncate_input,
                 debug=debug,
@@ -568,7 +646,36 @@ class TranslateGemmaNode:
                 translated_text = processor.decode(generated_ids, skip_special_tokens=True)
             else:
                 translated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            return (translated_text.strip(),)
+
+            image_result = translated_text.strip()
+            if not image_result:
+                return ("",)
+
+            if image_two_pass and source_code != target_code:
+                if debug:
+                    preview = image_result if len(image_result) <= 200 else image_result[:200] + "..."
+                    print(f"[TranslateGemma] Extracted text (pass 1): {preview}")
+
+                # Pass 2: translate extracted text to the user-selected target.
+                return self.translate(
+                    text=image_result,
+                    target_language=target_language,
+                    model_size=model_size,
+                    image=None,
+                    image_enhance=False,
+                    image_two_pass=False,
+                    source_language=source_language,
+                    external_text=None,
+                    prompt_mode="auto",
+                    max_new_tokens=max_new_tokens,
+                    max_input_tokens=max_input_tokens,
+                    truncate_input=truncate_input,
+                    strict_context_limit=strict_context_limit,
+                    keep_model_loaded=keep_model_loaded,
+                    debug=debug,
+                )
+
+            return (image_result,)
         except Exception as e:
             cleanup_torch_memory()
             hint = ""
@@ -581,12 +688,8 @@ class TranslateGemmaNode:
                 f"Image translation failed: {e}\n{hint}\n[Context] {inference_context}"
             ) from e
         finally:
-            if tmp_path:
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
+            # TG-025: Clean up temp image (respect debug mode)
+            cleanup_temp_image(tmp_path, keep_for_debug=debug)
             if not keep_model_loaded:
                 unload_current_model()
 

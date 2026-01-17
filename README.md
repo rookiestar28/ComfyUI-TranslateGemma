@@ -68,6 +68,9 @@ Category: `text/translation`
 | `text` | STRING | Built-in text input (multiline) |
 | `external_text` | STRING | Optional external input; overrides `text` when connected |
 | `image` | IMAGE | Optional image input; when connected, translates text found in the image |
+| `image_enhance` | BOOLEAN | Apply mild contrast/sharpening to improve small text visibility in images (default: `false`) |
+| `image_resize_mode` | COMBO | Image preprocessing mode: `letterbox` / `processor` / `stretch` (default: `letterbox`) |
+| `image_two_pass` | BOOLEAN | Two-pass image translation: extract text from image first, then translate extracted text (default: `true`) |
 | `target_language` | COMBO | Target language |
 | `source_language` | COMBO | Source language (default: Auto Detect) |
 | `model_size` | COMBO | 4B / 12B / 27B |
@@ -96,6 +99,20 @@ If you see wrong-language behavior, pick the `source_language` explicitly.
 ### Image Translation Requires Source Language
 
 For images, `source_language=Auto Detect` is not supported (no OCR pre-pass). Select the correct `source_language`.
+
+### Image Preprocessing (896×896)
+
+For image translation, the node supports multiple preprocessing modes via `image_resize_mode`:
+
+- `letterbox` (default): preserve aspect ratio (no stretching) by padding, then resize
+- `processor`: rely on the official Gemma3 image processor resize to **896×896** (may stretch)
+- `stretch`: force resize to **896×896** (may distort)
+
+If small text is missed, try enabling `image_enhance=true` to apply mild pixel-only enhancement.
+
+When `debug=true`, the node prints the path of the preprocessed temporary PNG and keeps it for inspection.
+
+Note: For image translation, `max_input_tokens` values that are too small can truncate the model’s visual tokens and cause unrelated outputs. The node enforces a safe minimum when truncation is enabled.
 
 ### Notes on Chinese Variants
 
