@@ -6,7 +6,7 @@
 
 A ComfyUI integration for TranslateGemma — Google's new open translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
 
-Official announcement: https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/
+ [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 
 ## Features
 
@@ -136,6 +136,12 @@ For better Traditional Chinese output consistency, the node maps:
 
 - Chinese (Simplified) -> `zh`
 - Chinese (Traditional) -> `zh-Hant`
+
+### Language Code Normalization (TG-010)
+
+The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
+
+If an unsupported language is passed, the node prints a warning and defaults to English. Set `TRANSLATEGEMMA_STRICT_LANG=1` to raise an error instead.
 
 ## Performance Tips
 

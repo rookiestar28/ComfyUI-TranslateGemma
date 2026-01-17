@@ -161,6 +161,9 @@ def _weights_present(local_dir: str) -> bool:
     Check if model weights are present in local_dir (TG-016).
     
     Looks for *.safetensors (preferred) or *.bin files.
+    
+    Note: TG-027 adds `_is_snapshot_complete()` for stricter validation.
+    This function is kept for backward compat but deprecated.
     """
     if not os.path.isdir(local_dir):
         return False
@@ -172,29 +175,142 @@ def _weights_present(local_dir: str) -> bool:
     return False
 
 
+def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, list[str]]:
+    """
+    Check if model snapshot in local_dir is complete (TG-027).
+    
+    Performs stricter validation than `_weights_present()`:
+    1. Required metadata: config.json + tokenizer/processor config
+    2. Weights completeness:
+       - If sharded (model.safetensors.index.json): verify all shards exist
+       - Else: verify single weight file exists
+    
+    Args:
+        local_dir: Model directory to check
+        debug: Print detailed missing file info
+        
+    Returns:
+        Tuple of (is_complete, missing_files_list)
+    """
+    import json
+    
+    if not os.path.isdir(local_dir):
+        return False, ["directory does not exist"]
+    
+    missing = []
+    
+    # 1. Check required metadata
+    required_metadata = ["config.json"]
+    tokenizer_files = [
+        "tokenizer_config.json",
+        "processor_config.json", 
+        "preprocessor_config.json",
+    ]
+    
+    for f in required_metadata:
+        if not os.path.exists(os.path.join(local_dir, f)):
+            missing.append(f)
+    
+    # At least one tokenizer/processor config should exist
+    tokenizer_found = any(
+        os.path.exists(os.path.join(local_dir, f)) for f in tokenizer_files
+    )
+    if not tokenizer_found:
+        missing.append("tokenizer/processor config (any of: " + ", ".join(tokenizer_files) + ")")
+    
+    # 2. Check weights completeness
+    index_file = os.path.join(local_dir, "model.safetensors.index.json")
+    
+    if os.path.exists(index_file):
+        # Sharded weights: parse index and verify all shards
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            
+            weight_map = index_data.get("weight_map", {})
+            shard_files = set(weight_map.values())
+            
+            for shard in shard_files:
+                shard_path = os.path.join(local_dir, shard)
+                if not os.path.exists(shard_path):
+                    missing.append(f"shard: {shard}")
+            
+            if debug and shard_files:
+                print(f"[TranslateGemma] Checking {len(shard_files)} shards from index")
+                
+        except (json.JSONDecodeError, KeyError, IOError) as e:
+            missing.append(f"model.safetensors.index.json (parse error: {e})")
+    else:
+        # Single-file weights
+        single_weight_files = ["model.safetensors", "pytorch_model.bin"]
+        weight_found = any(
+            os.path.exists(os.path.join(local_dir, f)) for f in single_weight_files
+        )
+        if not weight_found:
+            # Also check for sharded bin files
+            bin_index = os.path.join(local_dir, "pytorch_model.bin.index.json")
+            if os.path.exists(bin_index):
+                try:
+                    with open(bin_index, "r", encoding="utf-8") as f:
+                        index_data = json.load(f)
+                    weight_map = index_data.get("weight_map", {})
+                    shard_files = set(weight_map.values())
+                    for shard in shard_files:
+                        if not os.path.exists(os.path.join(local_dir, shard)):
+                            missing.append(f"shard: {shard}")
+                except Exception:
+                    missing.append("weights (no valid weight files found)")
+            else:
+                missing.append("weights (expected model.safetensors or pytorch_model.bin)")
+    
+    is_complete = len(missing) == 0
+    
+    if debug and missing:
+        capped = missing[:5]
+        suffix = f" (+{len(missing)-5} more)" if len(missing) > 5 else ""
+        print(f"[TranslateGemma] Incomplete snapshot, missing: {', '.join(capped)}{suffix}")
+    
+    return is_complete, missing
+
+
 def ensure_model_downloaded(
     repo_id: str,
     local_dir: str,
     revision: Optional[str] = None,
+    debug: bool = False,
 ) -> bool:
     """
-    Ensure model is downloaded to local_dir using huggingface_hub (TG-016).
+    Ensure model is downloaded to local_dir using huggingface_hub (TG-016/TG-027).
+    
+    TG-027: Uses `_is_snapshot_complete()` for stricter validation and supports
+    resumable downloads for incomplete snapshots.
     
     Args:
         repo_id: HuggingFace repo ID
         local_dir: Target directory for download
         revision: Optional revision (commit hash or tag)
+        debug: Print detailed diagnostics
         
     Returns:
-        True if download was performed or skipped (weights present)
+        True if download was performed or skipped (snapshot complete)
         
     Raises:
         RuntimeError: If download fails (with actionable auth instructions if applicable)
     """
-    # Skip if weights already present
-    if _weights_present(local_dir):
-        print(f"[TranslateGemma] Weights found in {local_dir}, skipping download")
+    # TG-027: Use stricter completeness check
+    is_complete, missing = _is_snapshot_complete(local_dir, debug=debug)
+    
+    if is_complete:
+        print(f"[TranslateGemma] Snapshot complete in {local_dir}, skipping download")
         return True
+    
+    # Snapshot incomplete or missing
+    if os.path.isdir(local_dir) and missing:
+        print(f"[TranslateGemma] Incomplete snapshot detected, will resume download...")
+        if debug:
+            capped = missing[:3]
+            suffix = f" (+{len(missing)-3} more)" if len(missing) > 3 else ""
+            print(f"[TranslateGemma] Missing: {', '.join(capped)}{suffix}")
     
     # Try huggingface_hub.snapshot_download
     try:
@@ -211,16 +327,29 @@ def ensure_model_downloaded(
         print(f"[TranslateGemma] Using revision: {revision}")
     
     try:
+        # TG-027: Enable resume_download for interrupted downloads
         snapshot_download(
             repo_id=repo_id,
             local_dir=local_dir,
             local_dir_use_symlinks=False,  # Windows-friendly
             revision=revision,
+            resume_download=True,  # TG-027: Resume partial downloads
         )
         print(f"[TranslateGemma] Download complete: {local_dir}")
+        
+        # TG-027: Post-download verification
+        is_complete_after, missing_after = _is_snapshot_complete(local_dir, debug=debug)
+        if not is_complete_after:
+            capped = missing_after[:5]
+            raise RuntimeError(
+                f"Download completed but snapshot still incomplete. "
+                f"Missing: {', '.join(capped)}. "
+                f"Try deleting '{local_dir}' and retrying."
+            )
+        
         return True
     except Exception as e:
-        # Check for auth/gating errors (use _detect_auth_error defined below)
+        # Check for auth/gating errors
         error_str = str(e).lower()
         auth_keywords = ["401", "403", "gated", "forbidden", "unauthorized", "access denied"]
         if any(kw in error_str for kw in auth_keywords):
@@ -235,6 +364,7 @@ def ensure_model_downloaded(
                 f"Original error: {e}"
             ) from e
         raise RuntimeError(f"Failed to download model '{repo_id}': {e}") from e
+
 
 def unload_current_model():
     """
