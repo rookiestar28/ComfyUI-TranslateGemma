@@ -137,7 +137,7 @@ For better Traditional Chinese output consistency, the node maps:
 - Chinese (Simplified) -> `zh`
 - Chinese (Traditional) -> `zh-Hant`
 
-### Language Code Normalization (TG-010)
+### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
 
@@ -159,22 +159,24 @@ If an unsupported language is passed, the node prints a warning and defaults to 
 
 ### Remote Code Policy (TG-026)
 
-- The loader attempts 	rust_remote_code=False first and only falls back to True if required.
-- Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0 to deny remote code entirely (fails if code is needed).
-- Set TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST=google/translategemma-4b-it,google/translategemma-12b-it to allow only specific repos.
+- The loader attempts `trust_remote_code=False` first and only falls back to `True` if required.
+- Set `TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0` to deny remote code entirely (fails if code is needed).
+- Set `TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST=google/translategemma-4b-it,google/translategemma-12b-it` to allow only specific repos.
 
 ### Revision Pinning
 
-- You can pin a specific revision for reproducibility via TRANSLATEGEMMA_REVISION=<commit-or-tag>.
+- You can pin a specific revision for reproducibility via `TRANSLATEGEMMA_REVISION=<commit-or-tag>`.
 
 ### Debug Privacy (TG-028)
 
-- By default, debug=true redacts sensitive data (user text content, full filesystem paths).
-- Set TRANSLATEGEMMA_VERBOSE_DEBUG=1 to enable full diagnostics (for troubleshooting).
+- By default, `debug=true` redacts sensitive data (user text content, full filesystem paths).
+- Set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` to enable full diagnostics (for troubleshooting).
 
 ### Download Recovery
 
 - If a download is interrupted, the loader auto-resumes on next run.
-- If corruption persists, delete the model folder (ComfyUI/models/LLM/TranslateGemma/<model>/) and retry.\r\n\r\n## License
+- If corruption persists, delete the model folder under `ComfyUI/models/LLM/TranslateGemma/` and retry.
 
-This repository provides a ComfyUI integration. TranslateGemma models are governed by the Gemma Terms of Use.
+## License
+
+This repository is licensed under the MIT License (see `LICENSE`). TranslateGemma model weights are governed by Google's Gemma Terms of Use.
