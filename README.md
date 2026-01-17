@@ -157,9 +157,24 @@ If an unsupported language is passed, the node prints a warning and defaults to 
 
 ## Security / Reproducibility Notes
 
-- The loader attempts `trust_remote_code=False` first and only falls back to `True` if required by the repo.
-- You can pin a specific revision for reproducibility via `TRANSLATEGEMMA_REVISION=<commit-or-tag>`.
+### Remote Code Policy (TG-026)
 
-## License
+- The loader attempts 	rust_remote_code=False first and only falls back to True if required.
+- Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0 to deny remote code entirely (fails if code is needed).
+- Set TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST=google/translategemma-4b-it,google/translategemma-12b-it to allow only specific repos.
+
+### Revision Pinning
+
+- You can pin a specific revision for reproducibility via TRANSLATEGEMMA_REVISION=<commit-or-tag>.
+
+### Debug Privacy (TG-028)
+
+- By default, debug=true redacts sensitive data (user text content, full filesystem paths).
+- Set TRANSLATEGEMMA_VERBOSE_DEBUG=1 to enable full diagnostics (for troubleshooting).
+
+### Download Recovery
+
+- If a download is interrupted, the loader auto-resumes on next run.
+- If corruption persists, delete the model folder (ComfyUI/models/LLM/TranslateGemma/<model>/) and retry.\r\n\r\n## License
 
 This repository provides a ComfyUI integration. TranslateGemma models are governed by the Gemma Terms of Use.

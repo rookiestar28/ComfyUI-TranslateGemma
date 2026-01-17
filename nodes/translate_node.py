@@ -23,6 +23,28 @@ from ..utils.prompt_builder import (
 from ..utils.context_utils import compute_effective_limits, suggest_max_new_tokens
 
 
+# TG-028: Debug privacy controls
+def _is_verbose_debug() -> bool:
+    """Check if verbose debug mode is enabled (TG-028)."""
+    return os.environ.get("TRANSLATEGEMMA_VERBOSE_DEBUG", "").strip() == "1"
+
+
+def _redact_path(path: str) -> str:
+    """Redact full path to basename only for non-verbose debug (TG-028)."""
+    if _is_verbose_debug():
+        return path
+    return os.path.basename(path) if path else path
+
+
+def _redact_text(text: str, max_len: int = 50) -> str:
+    """Redact text content for non-verbose debug (TG-028)."""
+    if _is_verbose_debug():
+        return text
+    if not text:
+        return "(empty)"
+    return f"[{len(text)} chars]"
+
+
 class TranslateGemmaNode:
     """
     ComfyUI node for translating text using TranslateGemma models.
@@ -300,8 +322,10 @@ class TranslateGemmaNode:
 
             if debug:
                 print(f"[TranslateGemma] Prompt rendered via fallback, mode={mode.value}, length={len(prompt)}")
-                preview = prompt[:50] + "..." + prompt[-50:] if len(prompt) > 100 else prompt
-                print(f"[TranslateGemma] Prompt preview: {preview}")
+                # TG-028: Redact prompt content unless verbose debug enabled
+                if _is_verbose_debug():
+                    preview = prompt[:50] + "..." + prompt[-50:] if len(prompt) > 100 else prompt
+                    print(f"[TranslateGemma] Prompt preview: {preview}")
 
             probe_max = max_input_tokens + 1024
             probe_result = tokenizer(
@@ -580,7 +604,7 @@ class TranslateGemmaNode:
             ]
             
             if debug:
-                print(f"[TranslateGemma] Image path: {tmp_path} (url-only structured)")
+                print(f"[TranslateGemma] Image path: {_redact_path(tmp_path)} (url-only structured)")
             
             inputs = processor.apply_chat_template(messages, **kwargs)
 
@@ -654,7 +678,10 @@ class TranslateGemmaNode:
 
             if image_two_pass and source_code != target_code:
                 if debug:
-                    preview = image_result if len(image_result) <= 200 else image_result[:200] + "..."
+                    # TG-028: Redact extracted text unless verbose debug enabled
+                    preview = _redact_text(image_result) if not _is_verbose_debug() else (
+                        image_result if len(image_result) <= 200 else image_result[:200] + "..."
+                    )
                     print(f"[TranslateGemma] Extracted text (pass 1): {preview}")
 
                 # Pass 2: translate extracted text to the user-selected target.

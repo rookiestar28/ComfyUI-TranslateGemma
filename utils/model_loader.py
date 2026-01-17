@@ -34,6 +34,38 @@ _current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
 _current_model_size: Optional[str] = None
 
 
+def _is_remote_code_allowed(repo_id: str = None) -> tuple[bool, str]:
+    """
+    Check if remote code execution is allowed based on policy (TG-026).
+    
+    Environment variables:
+    - TRANSLATEGEMMA_ALLOW_REMOTE_CODE: "1" (default) to allow, "0" to deny
+    - TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST: comma-separated repo IDs (optional)
+    
+    Precedence:
+    1) ALLOW_REMOTE_CODE=0 → deny always
+    2) If allowlist set → allow only if repo_id in allowlist
+    3) Else → allow (default)
+    
+    Returns:
+        Tuple of (is_allowed, reason_string)
+    """
+    allow_env = os.environ.get("TRANSLATEGEMMA_ALLOW_REMOTE_CODE", "1").strip()
+    
+    # Explicit deny
+    if allow_env == "0":
+        return False, "TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0"
+    
+    # Check allowlist if set
+    allowlist_env = os.environ.get("TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST", "").strip()
+    if allowlist_env:
+        allowed_repos = [r.strip() for r in allowlist_env.split(",") if r.strip()]
+        if repo_id and repo_id not in allowed_repos:
+            return False, f"repo_id '{repo_id}' not in TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST"
+    
+    return True, "default policy"
+
+
 def get_model_dir() -> str:
     """
     Get the base directory for TranslateGemma models.
@@ -512,7 +544,9 @@ def load_model(
         # TG-016: Explicit download before loading (Windows-friendly, skip if present)
         ensure_model_downloaded(repo_id, cache_dir, revision)
 
-        # TG-006: Try without trust_remote_code first, fall back if needed
+        # TG-006 + TG-026: Try without trust_remote_code first, fall back if policy allows
+        remote_code_allowed, policy_reason = _is_remote_code_allowed(repo_id)
+        
         try:
             processor = AutoProcessor.from_pretrained(
                 repo_id,
@@ -520,8 +554,13 @@ def load_model(
                 revision=revision,
                 trust_remote_code=False,
             )
-        except Exception:
-            print("[TranslateGemma] Loading processor with trust_remote_code=True")
+        except Exception as load_err:
+            if not remote_code_allowed:
+                raise RuntimeError(
+                    f"Loading '{repo_id}' requires remote code, but policy denies it ({policy_reason}). "
+                    f"Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 to allow, or add the repo to allowlist."
+                ) from load_err
+            print(f"[TranslateGemma] Loading processor with trust_remote_code=True (policy: {policy_reason})")
             processor = AutoProcessor.from_pretrained(
                 repo_id,
                 cache_dir=cache_dir,
@@ -529,7 +568,7 @@ def load_model(
                 trust_remote_code=True,
             )
 
-        # TG-017: Prefer safetensors
+        # TG-017 + TG-026: Prefer safetensors, apply remote-code policy
         try:
             model = AutoModelForImageTextToText.from_pretrained(
                 repo_id,
@@ -543,7 +582,14 @@ def load_model(
         except Exception as e:
             if "safetensors" in str(e).lower():
                 print("[TranslateGemma] safetensors not available, falling back to .bin")
-            print("[TranslateGemma] Loading model with trust_remote_code=True")
+            
+            if not remote_code_allowed:
+                raise RuntimeError(
+                    f"Loading '{repo_id}' model weights requires remote code, but policy denies it ({policy_reason}). "
+                    f"Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 to allow."
+                ) from e
+            
+            print(f"[TranslateGemma] Loading model with trust_remote_code=True (policy: {policy_reason})")
             model = AutoModelForImageTextToText.from_pretrained(
                 repo_id,
                 cache_dir=cache_dir,
