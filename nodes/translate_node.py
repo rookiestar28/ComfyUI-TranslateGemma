@@ -1,0 +1,630 @@
+import torch
+import os
+import tempfile
+import time
+from typing import Any
+from ..utils.language_utils import get_language_names, get_language_code
+from ..utils.language_detect import detect_source_lang_code
+from ..utils.model_loader import (
+    load_model, get_available_models, unload_current_model, 
+    cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS
+)
+from ..utils.prompt_builder import (
+    PromptMode,
+    render_prompt,
+    probe_tokenizer_capabilities,
+    build_structured_messages,
+)
+from ..utils.context_utils import compute_effective_limits, suggest_max_new_tokens
+
+
+class TranslateGemmaNode:
+    """
+    ComfyUI node for translating text using TranslateGemma models.
+    Supports 4B, 12B, and 27B model sizes with 55 languages.
+    
+    Prompt Modes:
+    - auto (default): Try structured format first, fall back to plain on failure
+    - structured: Force structured chat-template format (fail loudly if unsupported)
+    - plain: Force plain instruction format (no chat template)
+    
+    Token Limits (TG-003):
+    - max_new_tokens: Control output length (0 = auto)
+    - max_input_tokens: Control input truncation
+    - truncate_input: Enable/disable input truncation
+    - strict_context_limit: Clamp output to fit context window
+    
+    Memory Management (TG-004):
+    - keep_model_loaded: Keep model in memory between runs (default True)
+    - Single-model cache: Only one model in memory at a time
+    """
+    
+    CATEGORY = "text/translation"
+    FUNCTION = "translate"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("translated_text",)
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        languages = get_language_names()
+        model_sizes = get_available_models()
+        prompt_modes = PromptMode.get_values()
+        
+        return {
+            "required": {
+                "text": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Enter text to translate...",
+                }),
+                "target_language": (languages, {
+                    "default": "English",
+                }),
+                "model_size": (model_sizes, {
+                    "default": "4B",
+                    "tooltip": "Model size. If the repo is gated/private: accept terms on HuggingFace and authenticate via `hf auth login` (or HF_TOKEN env var).",
+                }),
+            },
+            "optional": {
+                "image": ("IMAGE", {
+                    "forceInput": True,
+                    "tooltip": "Optional image input. If connected, the node will translate text found in the image.",
+                }),
+                "source_language": (["Auto Detect"] + languages, {
+                    "default": "Auto Detect",
+                }),
+                "external_text": ("STRING", {
+                    "forceInput": True,
+                }),
+                "prompt_mode": (prompt_modes, {
+                    "default": "auto",
+                    "tooltip": "Prompt format: auto (try structured, fallback to plain), structured (force chat-template), plain (instruction only)",
+                }),
+                "max_new_tokens": ("INT", {
+                    "default": 512,
+                    "min": 0,
+                    "max": 2048,
+                    "step": 16,
+                    "tooltip": "Maximum number of tokens to generate (output length). Set to 0 for Auto.",
+                }),
+                "max_input_tokens": ("INT", {
+                    "default": 2048,
+                    "min": 64,
+                    "max": 8192,
+                    "step": 64,
+                    "tooltip": "Maximum input tokens (prompt will be truncated if exceeded)",
+                }),
+                "truncate_input": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Truncate input if it exceeds max_input_tokens (disable may cause OOM on long texts)",
+                }),
+                "strict_context_limit": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Clamp max_new_tokens so input + output doesn't exceed context window",
+                }),
+                "keep_model_loaded": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Keep model in memory after inference (disable to free VRAM between runs)",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable debug logging for prompt construction and tokenizer probing",
+                }),
+            },
+        }
+    
+    def translate(
+        self,
+        text: str,
+        target_language: str,
+        model_size: str,
+        image=None,
+        source_language: str = "Auto Detect",
+        external_text: str = None,
+        prompt_mode: str = "auto",
+        max_new_tokens: int = 512,
+        max_input_tokens: int = 2048,
+        truncate_input: bool = True,
+        strict_context_limit: bool = True,
+        keep_model_loaded: bool = True,
+        debug: bool = False,
+    ) -> tuple[str]:
+        """
+        Translate text to target language using TranslateGemma.
+        
+        Args:
+            text: Text from the built-in input field
+            target_language: Target language name
+            model_size: Model size (4B, 12B, 27B)
+            source_language: Source language name or "Auto Detect"
+            external_text: Optional external text input (overrides built-in text)
+            prompt_mode: Prompt construction mode (auto/structured/plain)
+            max_new_tokens: Maximum output tokens (TG-003)
+            max_input_tokens: Maximum input tokens before truncation (TG-003)
+            truncate_input: Whether to truncate long inputs (TG-003)
+            strict_context_limit: Clamp output to fit context (TG-003)
+            debug: Enable debug logging
+            
+        Returns:
+            Tuple containing translated text
+        """
+        if image is not None:
+            return self._translate_image(
+                image=image,
+                target_language=target_language,
+                model_size=model_size,
+                source_language=source_language,
+                max_new_tokens=max_new_tokens,
+                max_input_tokens=max_input_tokens,
+                truncate_input=truncate_input,
+                strict_context_limit=strict_context_limit,
+                keep_model_loaded=keep_model_loaded,
+                debug=debug,
+            )
+
+        # Use external text if provided, otherwise use built-in text
+        input_text = external_text if external_text else text
+        
+        if not input_text or not input_text.strip():
+            return ("",)
+        
+        target_code = get_language_code(target_language)
+        # TranslateGemma's official chat template requires an explicit source_lang_code
+        # (the model card does not define "auto"). For Auto Detect, do local detection.
+        if source_language != "Auto Detect":
+            source_code = get_language_code(source_language)
+        else:
+            source_code = detect_source_lang_code(input_text)
+            if debug:
+                print(f"[TranslateGemma] Auto-detected source_lang_code={source_code}")
+        
+        # Load model and processor/tokenizer
+        t_load_start = time.time()
+        model, processor = load_model(model_size)
+        t_load_s = time.time() - t_load_start
+        tokenizer = getattr(processor, "tokenizer", processor)
+
+        # Pick a safe input device (for device_map models, use the first parameter device).
+        try:
+            input_device = next(model.parameters()).device
+        except StopIteration:
+            input_device = getattr(model, "device", "cpu")
+
+        # Preferred compute dtype for floating inputs (pixel values, embeddings, etc).
+        # Keep consistent with utils/model_loader.py selection.
+        device = get_device()
+        dtype = get_torch_dtype(device)
+
+        if debug:
+            cuda_available = torch.cuda.is_available()
+            cuda_name = None
+            if cuda_available:
+                try:
+                    cuda_name = torch.cuda.get_device_name(torch.cuda.current_device())
+                except Exception:
+                    cuda_name = "unknown"
+
+            hf_device_map = getattr(model, "hf_device_map", None)
+            print(
+                "[TranslateGemma] Runtime info: "
+                f"torch={getattr(torch, '__version__', 'unknown')}, "
+                f"cuda_available={cuda_available}, cuda_device={cuda_name}, "
+                f"model_input_device={input_device}, "
+                f"hf_device_map={'present' if hf_device_map else 'none'}, "
+                f"dtype={dtype}, load_time_s={t_load_s:.2f}"
+            )
+            print(
+                "[TranslateGemma] Language codes: "
+                f"source_lang_code={source_code}, target_lang_code={target_code}"
+            )
+        
+        # Prompt mode handling
+        try:
+            mode = PromptMode(prompt_mode or "auto")
+        except ValueError:
+            print(f"[TranslateGemma] Invalid prompt_mode '{prompt_mode}', falling back to 'auto'")
+            mode = PromptMode.AUTO
+
+        # Prefer the official structured processor.apply_chat_template path for text translation.
+        # Ref: REFERENCE/translategemma4b/README.md ("With direct initialization")
+        used_path = "unknown"
+        inputs = None
+        raw_input_len = None
+        try:
+            if mode != PromptMode.PLAIN and hasattr(processor, "apply_chat_template"):
+                messages = build_structured_messages(
+                    input_text=input_text,
+                    target_lang_code=target_code,
+                    source_lang_code=source_code,
+                )
+                kwargs = dict(
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                if truncate_input:
+                    kwargs.update(dict(truncation=True, max_length=max_input_tokens))
+                inputs = processor.apply_chat_template(messages, **kwargs)
+                raw_input_len = int(inputs["input_ids"].shape[1])
+                used_path = "processor.apply_chat_template(structured)"
+        except Exception as e:
+            if mode == PromptMode.STRUCTURED:
+                raise RuntimeError(
+                    "Structured mode requested but processor.apply_chat_template failed."
+                ) from e
+            inputs = None
+
+        if inputs is None:
+            # Fallback to prompt-string rendering (older/unsupported stacks).
+            if debug:
+                capabilities = probe_tokenizer_capabilities(tokenizer, debug=True)
+                print(f"[TranslateGemma] Tokenizer capabilities: {capabilities}")
+
+            prompt = render_prompt(
+                tokenizer=tokenizer,
+                input_text=input_text,
+                target_lang_code=target_code,
+                source_lang_code=source_code,
+                mode=mode,
+                debug=debug,
+            )
+
+            if debug:
+                print(f"[TranslateGemma] Prompt rendered via fallback, mode={mode.value}, length={len(prompt)}")
+                preview = prompt[:50] + "..." + prompt[-50:] if len(prompt) > 100 else prompt
+                print(f"[TranslateGemma] Prompt preview: {preview}")
+
+            probe_max = max_input_tokens + 1024
+            probe_result = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=probe_max,
+            )
+            raw_input_len = int(probe_result["input_ids"].shape[1])
+
+            if truncate_input:
+                inputs = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_input_tokens,
+                )
+            else:
+                inputs = tokenizer(prompt, return_tensors="pt")
+
+            used_path = "tokenizer(prompt)"
+
+        actual_input_len = int(inputs["input_ids"].shape[1])
+        if debug:
+            print(
+                f"[TranslateGemma] Text path: {used_path}, "
+                f"raw_input_tokens={raw_input_len}, actual_input_tokens={actual_input_len}"
+            )
+
+        requested_max_new_tokens = max_new_tokens
+        if int(max_new_tokens) == 0:
+            requested_max_new_tokens = suggest_max_new_tokens(actual_input_len)
+            if debug:
+                print(
+                    f"[TranslateGemma] max_new_tokens=0 (Auto) -> "
+                    f"requested_max_new_tokens={requested_max_new_tokens}"
+                )
+
+        # Compute effective limits (TG-003)
+        limits = compute_effective_limits(
+            tokenizer=tokenizer,
+            input_len=int(raw_input_len),
+            max_new_tokens=int(requested_max_new_tokens),
+            max_input_tokens=max_input_tokens,
+            strict_context_limit=strict_context_limit,
+            truncate_input=truncate_input,
+            debug=debug,
+        )
+
+        # Extra guard for translation tasks: short inputs rarely need huge generation windows.
+        # This helps reduce repetitive continuations when the model does not emit EOS early.
+        heuristic_cap = int(actual_input_len * 2 + 64)
+        limits["effective_max_new_tokens"] = min(limits["effective_max_new_tokens"], heuristic_cap)
+        
+        # Check if we have room for generation
+        if limits["effective_max_new_tokens"] == 0:
+            warning_msg = (
+                f"[TranslateGemma] Input too long ({raw_input_len} tokens) - "
+                f"no room for generation within context limit ({limits['context_limit']})"
+            )
+            print(warning_msg)
+            return (f"[Error: Input too long - {raw_input_len} tokens exceeds context limit]",)
+        
+        # Move tensors to device (do not cast int tensors to dtype).
+        moved_inputs = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                if v.is_floating_point():
+                    moved_inputs[k] = v.to(input_device, dtype=dtype)
+                else:
+                    moved_inputs[k] = v.to(input_device)
+            else:
+                moved_inputs[k] = v
+        inputs = moved_inputs
+        
+        # TG-007: Defensive model.eval() (idempotent) + inference_mode for best practices
+        model.eval()
+        
+        # Build context for error messages (TG-008)
+        # Include repo_id/device/dtype/cache_dir as per TG-008 requirements
+        repo_id = MODEL_REPOS.get(model_size) or "unknown"
+        cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
+        inference_context = (
+            f"model_size: {model_size} | repo_id: {repo_id} | "
+            f"device: {device} | dtype: {dtype} | cache_dir: {cache_dir} | "
+            f"user_max_new_tokens: {max_new_tokens} | "
+            f"requested_max_new_tokens: {requested_max_new_tokens} | "
+            f"effective_max_new_tokens: {limits['effective_max_new_tokens']} | "
+            f"raw_input_tokens: {raw_input_len} | actual_input_tokens: {actual_input_len} | "
+            f"truncate: {truncate_input} | strict_limit: {strict_context_limit}"
+        )
+        
+        # Generate translation with effective max_new_tokens (TG-003)
+        # Use try/except/finally for error handling and guaranteed cleanup (TG-004/008/018)
+        try:
+            with torch.inference_mode():  # TG-007: Stronger than no_grad()
+                gen_kwargs = dict(
+                    **inputs,
+                    max_new_tokens=limits["effective_max_new_tokens"],
+                    do_sample=False,
+                    use_cache=True,  # TG-007: Explicit for performance
+                )
+                eos_token_id = getattr(tokenizer, "eos_token_id", None)
+                if eos_token_id is not None:
+                    gen_kwargs["eos_token_id"] = eos_token_id
+                    gen_kwargs["pad_token_id"] = eos_token_id
+
+                t_gen_start = time.time()
+                outputs = model.generate(**gen_kwargs)
+                if debug:
+                    print(f"[TranslateGemma] Generation time_s={time.time() - t_gen_start:.2f}")
+            
+            # Decode output
+            generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+            if hasattr(processor, "decode"):
+                translated_text = processor.decode(generated_ids, skip_special_tokens=True)
+            else:
+                translated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            
+            return (translated_text.strip(),)
+        except Exception as e:
+            # TG-008: Include context in inference errors
+            # TG-018: Cleanup on error (even if keep_model_loaded=True)
+            cleanup_torch_memory()
+            raise RuntimeError(f"Translation failed: {e}\n[Context] {inference_context}") from e
+        finally:
+            # TG-004: Unload model if keep_model_loaded is False
+            if not keep_model_loaded:
+                unload_current_model()
+
+    def _translate_image(
+        self,
+        image: Any,
+        target_language: str,
+        model_size: str,
+        source_language: str,
+        max_new_tokens: int,
+        max_input_tokens: int,
+        truncate_input: bool,
+        strict_context_limit: bool,
+        keep_model_loaded: bool,
+        debug: bool,
+    ) -> tuple[str]:
+        """
+        Translate text found in an image using TranslateGemma multimodal chat template.
+
+        Ref: `REFERENCE/translategemma4b/README.md` ("Text Extraction and Translation")
+        """
+        # The official template requires an explicit source_lang_code; OCR-free auto-detect
+        # is not supported. Require the user to select a source language for images.
+        if source_language == "Auto Detect":
+            return (
+                "[Error: Image translation requires an explicit source_language. "
+                "Auto Detect is not supported by the official TranslateGemma chat template.]",
+            )
+
+        t_load_start = time.time()
+        model, processor = load_model(model_size)
+        t_load_s = time.time() - t_load_start
+        tokenizer = getattr(processor, "tokenizer", processor)
+
+        try:
+            input_device = next(model.parameters()).device
+        except StopIteration:
+            input_device = getattr(model, "device", "cpu")
+
+        if debug:
+            cuda_available = torch.cuda.is_available()
+            cuda_name = None
+            if cuda_available:
+                try:
+                    cuda_name = torch.cuda.get_device_name(torch.cuda.current_device())
+                except Exception:
+                    cuda_name = "unknown"
+            print(
+                "[TranslateGemma] Image runtime info: "
+                f"cuda_available={cuda_available}, cuda_device={cuda_name}, "
+                f"model_input_device={input_device}, load_time_s={t_load_s:.2f}"
+            )
+
+        target_code = get_language_code(target_language)
+        source_code = get_language_code(source_language)
+
+        pil_image = self._comfy_image_to_pil(image)
+
+        repo_id = MODEL_REPOS.get(model_size) or "unknown"
+        device = get_device()
+        dtype = get_torch_dtype(device)
+        cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
+        inference_context = (
+            f"mode: image | model_size: {model_size} | repo_id: {repo_id} | "
+            f"device: {device} | dtype: {dtype} | cache_dir: {cache_dir} | "
+            f"user_max_new_tokens: {max_new_tokens} | max_input_tokens: {max_input_tokens} | "
+            f"truncate: {truncate_input} | strict_limit: {strict_context_limit} | "
+            f"source_lang_code: {source_code} | target_lang_code: {target_code}"
+        )
+
+        tmp_path = None
+        try:
+            kwargs = dict(
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            if truncate_input:
+                kwargs.update(dict(truncation=True, max_length=max_input_tokens))
+
+            # First try: pass the PIL image directly (some processors support this).
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source_lang_code": source_code,
+                            "target_lang_code": target_code,
+                            "image": pil_image,
+                        }
+                    ],
+                }
+            ]
+            try:
+                inputs = processor.apply_chat_template(messages, **kwargs)
+            except Exception:
+                # Fallback: save a temporary file and pass a local path via `url`
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    tmp_path = f.name
+                pil_image.save(tmp_path)
+
+                messages[0]["content"][0].pop("image", None)
+                messages[0]["content"][0]["url"] = tmp_path
+                inputs = processor.apply_chat_template(messages, **kwargs)
+
+            # Move tensors to the model device; cast only floating tensors to dtype (e.g. pixel values).
+            moved_inputs = {}
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    if v.is_floating_point():
+                        moved_inputs[k] = v.to(input_device, dtype=dtype)
+                    else:
+                        moved_inputs[k] = v.to(input_device)
+                else:
+                    moved_inputs[k] = v
+            inputs = moved_inputs
+
+            input_len = int(inputs["input_ids"].shape[1])
+
+            requested_max_new_tokens = max_new_tokens
+            if int(max_new_tokens) == 0:
+                requested_max_new_tokens = suggest_max_new_tokens(input_len)
+                if debug:
+                    print(
+                        f"[TranslateGemma] (image) max_new_tokens=0 (Auto) -> "
+                        f"requested_max_new_tokens={requested_max_new_tokens}"
+                    )
+
+            limits = compute_effective_limits(
+                tokenizer=tokenizer,
+                input_len=input_len,
+                max_new_tokens=int(requested_max_new_tokens),
+                max_input_tokens=max_input_tokens,
+                strict_context_limit=strict_context_limit,
+                truncate_input=truncate_input,
+                debug=debug,
+            )
+            heuristic_cap = int(input_len * 2 + 64)
+            limits["effective_max_new_tokens"] = min(limits["effective_max_new_tokens"], heuristic_cap)
+            if limits["effective_max_new_tokens"] == 0:
+                return (f"[Error: Input too long - {input_len} tokens exceeds context limit]",)
+
+            model.eval()
+            with torch.inference_mode():
+                gen_kwargs = dict(
+                    **inputs,
+                    max_new_tokens=limits["effective_max_new_tokens"],
+                    do_sample=False,
+                    use_cache=True,
+                )
+                eos_token_id = getattr(tokenizer, "eos_token_id", None)
+                if eos_token_id is not None:
+                    gen_kwargs["eos_token_id"] = eos_token_id
+                    gen_kwargs["pad_token_id"] = eos_token_id
+
+                t_gen_start = time.time()
+                outputs = model.generate(**gen_kwargs)
+                if debug:
+                    print(f"[TranslateGemma] Image generation time_s={time.time() - t_gen_start:.2f}")
+
+            generated_ids = outputs[0][input_len:]
+            if hasattr(processor, "decode"):
+                translated_text = processor.decode(generated_ids, skip_special_tokens=True)
+            else:
+                translated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return (translated_text.strip(),)
+        except Exception as e:
+            cleanup_torch_memory()
+            hint = ""
+            if source_language == "Auto Detect":
+                hint = (
+                    "Note: Image translation may require an explicit `source_language` "
+                    "(the official template requires source_lang_code)."
+                )
+            raise RuntimeError(
+                f"Image translation failed: {e}\n{hint}\n[Context] {inference_context}"
+            ) from e
+        finally:
+            if tmp_path:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+            if not keep_model_loaded:
+                unload_current_model()
+
+    @staticmethod
+    def _comfy_image_to_pil(image: Any):
+        import numpy as np
+        from PIL import Image
+
+        if isinstance(image, torch.Tensor):
+            arr = image.detach().cpu().numpy()
+        else:
+            arr = np.asarray(image)
+
+        # ComfyUI IMAGE is typically [B,H,W,C]
+        if arr.ndim == 4:
+            arr = arr[0]
+        if arr.ndim != 3:
+            raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+        if arr.shape[-1] == 4:
+            arr = arr[..., :3]
+
+        # Normalize to uint8 RGB
+        if arr.dtype != np.uint8:
+            max_val = float(arr.max()) if arr.size else 1.0
+            if max_val <= 1.5:
+                arr = (arr.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                arr = arr.clip(0.0, 255.0).astype(np.uint8)
+
+        return Image.fromarray(arr, mode="RGB")
+
+
+# Node class mappings for this module
+NODE_CLASS_MAPPINGS = {
+    "TranslateGemma": TranslateGemmaNode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "TranslateGemma": "TranslateGemma",
+}

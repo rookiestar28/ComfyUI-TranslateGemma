@@ -1,0 +1,474 @@
+"""
+Model loader for TranslateGemma with single-model cache and robust memory management.
+
+TG-004: Rework in-memory cache to avoid VRAM/RAM blowups
+TG-005: Structured disk layout
+TG-006: trust_remote_code risk reduction
+TG-016: Explicit snapshot_download with Windows-friendly settings
+TG-017: Prefer safetensors
+
+Reference: 260117-BUNDLE-B_PLAN.md
+"""
+
+import os
+import gc
+from typing import Optional
+import torch
+from transformers import AutoTokenizer
+try:
+    from transformers import AutoProcessor, AutoModelForImageTextToText
+except Exception:  # pragma: no cover
+    AutoProcessor = None
+    AutoModelForImageTextToText = None
+import folder_paths
+
+# Model repository mapping
+MODEL_REPOS = {
+    "4B": "google/translategemma-4b-it",
+    "12B": "google/translategemma-12b-it",
+    "27B": "google/translategemma-27b-it",
+}
+
+# Single-model cache (TG-004: only one model in memory at a time)
+_current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
+_current_model_size: Optional[str] = None
+
+
+def get_model_dir() -> str:
+    """
+    Get the base directory for TranslateGemma models.
+    
+    Uses structured path: ComfyUI/models/LLM/TranslateGemma/ if LLM exists,
+    otherwise ComfyUI/models/translate_gemma/
+    
+    Returns:
+        Base directory path for model storage
+    """
+    models_dir = folder_paths.models_dir
+    
+    # Try LLM folder first (preferred)
+    llm_dir = os.path.join(models_dir, "LLM", "TranslateGemma")
+    if os.path.exists(os.path.join(models_dir, "LLM")) or not os.path.exists(os.path.join(models_dir, "translate_gemma")):
+        os.makedirs(llm_dir, exist_ok=True)
+        return llm_dir
+    
+    # Fallback to translate_gemma
+    translate_dir = os.path.join(models_dir, "translate_gemma")
+    os.makedirs(translate_dir, exist_ok=True)
+    return translate_dir
+
+
+def get_model_path(repo_id: str) -> str:
+    """
+    Get the local cache path for a specific model repo (TG-005: isolated per repo).
+    
+    Args:
+        repo_id: HuggingFace repo ID (e.g., "google/translategemma-4b-it")
+        
+    Returns:
+        Directory path for this specific model
+    """
+    base_dir = get_model_dir()
+    # Convert repo_id to safe directory name (e.g., google/translategemma-4b-it -> translategemma-4b-it)
+    repo_name = repo_id.split("/")[-1]
+    model_dir = os.path.join(base_dir, repo_name)
+    os.makedirs(model_dir, exist_ok=True)
+    return model_dir
+
+
+def get_device() -> str:
+    """Determine the best available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def cuda_supports_bf16(device_index: int = None) -> bool:
+    """
+    Check if CUDA device supports BF16 (bfloat16).
+    
+    Args:
+        device_index: CUDA device index to check. If None, uses current device.
+    
+    Detection strategy:
+    - Uses torch.cuda.get_device_capability(device_index) for multi-GPU accuracy
+    - Ampere (SM 8.0) and newer support BF16
+    
+    Returns:
+        True if BF16 is supported, False otherwise
+    """
+    if not torch.cuda.is_available():
+        return False
+    
+    try:
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(device_index)
+        return major >= 8
+    except Exception:
+        return False
+
+
+def _parse_cuda_device_index(device: str) -> int:
+    """Parse CUDA device index from device string."""
+    if ":" in device:
+        try:
+            return int(device.split(":")[1])
+        except (ValueError, IndexError):
+            return 0
+    return torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+
+def get_torch_dtype(device: str) -> torch.dtype:
+    """
+    Determine the optimal torch dtype for the given device.
+    
+    Returns:
+        - cuda: bfloat16 if supported, else float16
+        - mps/cpu: float32 (conservative, stable)
+    """
+    if device.startswith("cuda"):
+        device_index = _parse_cuda_device_index(device)
+        if cuda_supports_bf16(device_index):
+            return torch.bfloat16
+        else:
+            return torch.float16
+    else:
+        return torch.float32
+
+
+def cleanup_torch_memory():
+    """
+    Clean up GPU/CPU memory after model unload (TG-004).
+    
+    Performs:
+    - Python garbage collection
+    - CUDA cache clearing (if available)
+    - CUDA IPC collection (if available)
+    """
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+
+
+def _weights_present(local_dir: str) -> bool:
+    """
+    Check if model weights are present in local_dir (TG-016).
+    
+    Looks for *.safetensors (preferred) or *.bin files.
+    """
+    if not os.path.isdir(local_dir):
+        return False
+    
+    for root, _, files in os.walk(local_dir):
+        for f in files:
+            if f.endswith(".safetensors") or f.endswith(".bin"):
+                return True
+    return False
+
+
+def ensure_model_downloaded(
+    repo_id: str,
+    local_dir: str,
+    revision: Optional[str] = None,
+) -> bool:
+    """
+    Ensure model is downloaded to local_dir using huggingface_hub (TG-016).
+    
+    Args:
+        repo_id: HuggingFace repo ID
+        local_dir: Target directory for download
+        revision: Optional revision (commit hash or tag)
+        
+    Returns:
+        True if download was performed or skipped (weights present)
+        
+    Raises:
+        RuntimeError: If download fails (with actionable auth instructions if applicable)
+    """
+    # Skip if weights already present
+    if _weights_present(local_dir):
+        print(f"[TranslateGemma] Weights found in {local_dir}, skipping download")
+        return True
+    
+    # Try huggingface_hub.snapshot_download
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print(
+            "[TranslateGemma] WARNING: huggingface_hub not available, "
+            "falling back to transformers implicit download"
+        )
+        return False
+    
+    print(f"[TranslateGemma] Downloading {repo_id} to {local_dir}...")
+    if revision:
+        print(f"[TranslateGemma] Using revision: {revision}")
+    
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False,  # Windows-friendly
+            revision=revision,
+        )
+        print(f"[TranslateGemma] Download complete: {local_dir}")
+        return True
+    except Exception as e:
+        # Check for auth/gating errors (use _detect_auth_error defined below)
+        error_str = str(e).lower()
+        auth_keywords = ["401", "403", "gated", "forbidden", "unauthorized", "access denied"]
+        if any(kw in error_str for kw in auth_keywords):
+            raise RuntimeError(
+                f"Failed to download model '{repo_id}' - access denied.\n\n"
+                "To resolve:\n"
+                "1. Visit the model page on Hugging Face and accept the license terms\n"
+                "2. Authenticate with Hugging Face (one of):\n"
+                "   - Run: hf auth login\n"
+                "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
+                "3. Restart ComfyUI\n\n"
+                f"Original error: {e}"
+            ) from e
+        raise RuntimeError(f"Failed to download model '{repo_id}': {e}") from e
+
+def unload_current_model():
+    """
+    Unload the currently loaded model and free memory (TG-004).
+    
+    This ensures only one model is in memory at a time.
+    """
+    global _current_model, _current_model_size
+    
+    if _current_model is not None:
+        model, processor_or_tokenizer = _current_model
+        model_size = _current_model_size
+        
+        # Clear references
+        _current_model = None
+        _current_model_size = None
+        del model
+        del processor_or_tokenizer
+        
+        # Clean up memory
+        cleanup_torch_memory()
+        
+        print(f"[TranslateGemma] {model_size} model unloaded, memory cleaned")
+
+
+def _detect_auth_error(error: Exception) -> bool:
+    """
+    Detect if error is related to Hugging Face authentication / gating.
+
+    Note: Avoid overly broad "token" matching to prevent false positives like "tokenizer".
+    """
+    error_str = str(error).lower()
+    if any(keyword in error_str for keyword in [
+        "401",
+        "403",
+        "gated",
+        "gated repo",
+        "requires authentication",
+        "forbidden",
+        "unauthorized",
+        "access denied",
+        "authentication required",
+        "not authenticated",
+    ]):
+        return True
+
+    # huggingface_hub sometimes reports gated/private repos as "not a valid model identifier"
+    # and suggests authentication. Only treat this as auth-related when that phrase appears.
+    return (
+        "is not a local folder and is not a valid model identifier" in error_str
+        and ("hf auth login" in error_str or "token=" in error_str or "use_auth_token" in error_str)
+    )
+
+
+def _build_load_context(
+    model_size: str,
+    repo_id: str,
+    device: str,
+    dtype,
+    cache_dir: str,
+    revision: str = None,
+) -> str:
+    """
+    Build context string for error messages (TG-008).
+    
+    Provides key information for debugging load/inference failures.
+    """
+    lines = [
+        f"model_size: {model_size}",
+        f"repo_id: {repo_id}",
+        f"device: {device}",
+        f"dtype: {dtype}",
+        f"cache_dir: {cache_dir}",
+    ]
+    if revision:
+        lines.append(f"revision: {revision}")
+    return " | ".join(lines)
+
+def _raise_auth_error(repo_id: str, original_error: Exception):
+    """Raise user-friendly error for gated model access issues (TG-004)."""
+    raise RuntimeError(
+        f"Failed to access model '{repo_id}' - this may be a gated model.\n\n"
+        "To resolve:\n"
+        "1. Visit the model page on Hugging Face and accept the license terms\n"
+        "2. Authenticate with Hugging Face (one of):\n"
+        "   - Run: hf auth login\n"
+        "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
+        "3. Restart ComfyUI\n\n"
+        f"Original error: {original_error}"
+    )
+
+
+def load_model(
+    model_size: str,
+    revision: Optional[str] = None,
+) -> tuple:
+    """
+    Load TranslateGemma model and tokenizer with single-model cache (TG-004).
+    
+    Args:
+        model_size: One of "4B", "12B", "27B"
+        revision: Optional HuggingFace revision/commit hash for reproducibility (TG-006)
+        
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    global _current_model, _current_model_size
+    
+    # Check env var for revision override
+    env_revision = os.environ.get("TRANSLATEGEMMA_REVISION")
+    if env_revision and not revision:
+        revision = env_revision
+    
+    # Return cached model if same size is requested
+    if _current_model is not None and _current_model_size == model_size:
+        print(f"[TranslateGemma] Using cached {model_size} model")
+        return _current_model
+    
+    # Unload current model before loading new one (single-model cache)
+    if _current_model is not None:
+        print(f"[TranslateGemma] Switching from {_current_model_size} to {model_size}")
+        unload_current_model()
+    
+    repo_id = MODEL_REPOS.get(model_size)
+    if not repo_id:
+        raise ValueError(f"Invalid model size: {model_size}. Choose from: {list(MODEL_REPOS.keys())}")
+    
+    device = get_device()
+    cache_dir = get_model_path(repo_id)  # TG-005: isolated per repo
+    dtype = get_torch_dtype(device)
+    
+    print(f"[TranslateGemma] Loading {model_size} model from {repo_id}...")
+    print(f"[TranslateGemma] Device: {device}, dtype: {dtype}")
+    print(f"[TranslateGemma] Cache dir: {cache_dir}")
+    if revision:
+        print(f"[TranslateGemma] Revision: {revision}")
+
+    try:
+        if AutoProcessor is None or AutoModelForImageTextToText is None:
+            raise RuntimeError(
+                "TranslateGemma (Gemma 3) requires a newer transformers build that provides "
+                "`AutoProcessor` and `AutoModelForImageTextToText` (recommended: transformers>=4.57)."
+            )
+
+        # TG-016: Explicit download before loading (Windows-friendly, skip if present)
+        ensure_model_downloaded(repo_id, cache_dir, revision)
+
+        # TG-006: Try without trust_remote_code first, fall back if needed
+        try:
+            processor = AutoProcessor.from_pretrained(
+                repo_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                trust_remote_code=False,
+            )
+        except Exception:
+            print("[TranslateGemma] Loading processor with trust_remote_code=True")
+            processor = AutoProcessor.from_pretrained(
+                repo_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                trust_remote_code=True,
+            )
+
+        # TG-017: Prefer safetensors
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                repo_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                torch_dtype=dtype,
+                device_map="auto" if device.startswith("cuda") else None,
+                trust_remote_code=False,
+                use_safetensors=True,
+            )
+        except Exception as e:
+            if "safetensors" in str(e).lower():
+                print("[TranslateGemma] safetensors not available, falling back to .bin")
+            print("[TranslateGemma] Loading model with trust_remote_code=True")
+            model = AutoModelForImageTextToText.from_pretrained(
+                repo_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                torch_dtype=dtype,
+                device_map="auto" if device.startswith("cuda") else None,
+                trust_remote_code=True,
+            )
+
+        if not device.startswith("cuda"):
+            model = model.to(device)
+
+        # TG-007: Set model to eval mode for inference
+        model.eval()
+
+        # Cache the loaded model (single-model cache)
+        _current_model = (model, processor)
+        _current_model_size = model_size
+
+        print(f"[TranslateGemma] {model_size} model loaded successfully on {device} (eval mode)")
+        return model, processor
+
+    except Exception as e:
+        # Clean up any partially loaded resources
+        cleanup_torch_memory()
+        
+        # TG-004: Detect gated/auth errors and provide actionable guidance
+        if _detect_auth_error(e):
+            _raise_auth_error(repo_id, e)
+        
+        # TG-008: Include context in error message
+        context = _build_load_context(model_size, repo_id, device, dtype, cache_dir, revision)
+        raise RuntimeError(f"Failed to load TranslateGemma: {e}\n[Context] {context}") from e
+
+
+def unload_model(model_size: str = None):
+    """
+    Unload model from memory (backward compatible API).
+    
+    Args:
+        model_size: Ignored for single-model cache; unloads current model
+    """
+    unload_current_model()
+
+
+def get_available_models() -> list[str]:
+    """Return list of available model sizes."""
+    return list(MODEL_REPOS.keys())
+
+
+def get_current_model_size() -> Optional[str]:
+    """Return the currently loaded model size, or None if no model is loaded."""
+    return _current_model_size
+
+
+def is_model_loaded() -> bool:
+    """Check if a model is currently loaded."""
+    return _current_model is not None
