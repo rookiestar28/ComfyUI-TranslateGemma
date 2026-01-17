@@ -5,6 +5,7 @@ from .language_utils import (
     get_language_names,
     get_language_code,
     get_language_name,
+    normalize_lang_code,
 )
 from .language_detect import (
     detect_source_lang_code,
@@ -53,6 +54,7 @@ __all__ = [
     "get_language_names",
     "get_language_code",
     "get_language_name",
+    "normalize_lang_code",
     "load_model",
     "unload_model",
     "unload_current_model",

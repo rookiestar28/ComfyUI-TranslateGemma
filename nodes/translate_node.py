@@ -92,6 +92,7 @@ class TranslateGemmaNode:
                 }),
                 "external_text": ("STRING", {
                     "forceInput": True,
+                    "tooltip": "(TG-009) External text input. When connected, overrides the built-in text field (even if empty).",
                 }),
                 "prompt_mode": (prompt_modes, {
                     "default": "auto",
@@ -189,8 +190,8 @@ class TranslateGemmaNode:
                 debug=debug,
             )
 
-        # Use external text if provided, otherwise use built-in text
-        input_text = external_text if external_text else text
+        # TG-009: Use external text if connected (is not None), otherwise use built-in text
+        input_text = external_text if external_text is not None else text
         
         if not input_text or not input_text.strip():
             return ("",)

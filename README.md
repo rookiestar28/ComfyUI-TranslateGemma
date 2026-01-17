@@ -6,6 +6,8 @@
 
 A ComfyUI integration for TranslateGemma — Google's new open translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
 
+Official announcement: https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/
+
 ## Features
 
 - Text translation across 55 languages
@@ -16,6 +18,14 @@ A ComfyUI integration for TranslateGemma — Google's new open translation model
 
 ## Installation
 
+### Option A: ComfyUI-Manager
+
+1) Open ComfyUI-Manager.
+2) Search for `TranslateGemma`.
+3) Install and restart ComfyUI.
+
+### Option B: Manual
+
 1) Clone into your ComfyUI `custom_nodes` directory:
 
 ```bash
@@ -23,35 +33,37 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/rookiestar28/ComfyUI-TranslateGemma.git
 ```
 
-2) Install dependencies:
+1) Install dependencies:
 
 ```bash
 cd ComfyUI-TranslateGemma
 pip install -r requirements.txt
 ```
 
-3) Restart ComfyUI.
+1) Restart ComfyUI.
 
 ## Hugging Face Access (Gated Models)
 
 TranslateGemma repos are gated under the Gemma terms.
 
 1) Visit the model page and accept the license terms:
+
 - `google/translategemma-4b-it`
 - `google/translategemma-12b-it`
 - `google/translategemma-27b-it`
 
-2) Authenticate (recommended):
+1) Authenticate (recommended):
 
 ```bash
 hf auth login
 ```
 
 Alternatively, set one of these environment variables for the ComfyUI process:
+
 - `HF_TOKEN`
 - `HUGGINGFACE_HUB_TOKEN`
 
-3) Restart ComfyUI after changing authentication.
+1) Restart ComfyUI after changing authentication.
 
 ## Model Storage Location
 
@@ -70,7 +82,7 @@ Category: `text/translation`
 | Name | Type | Description |
 |------|------|-------------|
 | `text` | STRING | Built-in text input (multiline) |
-| `external_text` | STRING | Optional external input; overrides `text` when connected |
+| `external_text` | STRING | Optional external input; when connected, **overrides** `text` (even if empty) |
 | `image` | IMAGE | Optional image input; when connected, translates text found in the image |
 | `image_enhance` | BOOLEAN | Apply mild contrast/sharpening to improve small text visibility in images (default: `false`) |
 | `image_resize_mode` | COMBO | Image preprocessing mode: `letterbox` / `processor` / `stretch` (default: `letterbox`) |
@@ -130,6 +142,12 @@ For better Traditional Chinese output consistency, the node maps:
 - Leave `keep_model_loaded=true` for repeated use (avoids reload time).
 - Use the 4B model if you are unsure about hardware limits.
 - First run is slower due to download and weight initialization.
+
+## VRAM Notes (Native Models)
+
+- 4B model: ~12 GB
+- 12B model: ~27 GB
+- 27B model: ~56 GB
 
 ## Security / Reproducibility Notes
 
