@@ -134,6 +134,10 @@ If small text is missed, try enabling `image_enhance=true` to apply mild pixel-o
 
 When `debug=true`, the node prints the path of the preprocessed temporary PNG and keeps it for inspection.
 
+Additionally, when `debug=true`, the node saves intermediate images under `debug/`:
+- `resize_mode` + `enhance_mode` prefixed files
+- both the resize-only and enhance-applied variants (when enabled)
+
 Note: For image translation, `max_input_tokens` values that are too small can truncate the model’s visual tokens and cause unrelated outputs. The node enforces a safe minimum when truncation is enabled.
 
 ### Notes on Chinese Variants
