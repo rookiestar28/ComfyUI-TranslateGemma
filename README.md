@@ -143,6 +143,13 @@ When `source_language=Auto Detect`, the node will try to distinguish Simplified 
 
 If the text is too short or ambiguous, Auto Detect may still resolve to `zh`. For guaranteed behavior, select the desired `source_language` explicitly.
 
+Tip: If your input is Simplified Chinese but you want Traditional output, set `source_language=Auto Detect` (or `Chinese (Simplified)`) and `target_language=Chinese (Traditional)`.
+
+If you still see mixed Simplified/Traditional output when targeting Traditional Chinese, you can enable a best-effort post-edit conversion using OpenCC:
+- Install: `pip install opencc-python-reimplemented`
+- Default behavior: when `target_language=Chinese (Traditional)` the node will convert Simplified → Traditional if OpenCC is available
+- Disable: set `TRANSLATEGEMMA_TRADITIONAL_POSTEDIT=0`
+
 ### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.

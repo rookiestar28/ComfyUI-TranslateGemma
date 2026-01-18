@@ -11,6 +11,7 @@ from ..utils.image_preprocess import (
     save_preprocessed_image,
     cleanup_temp_image,
 )
+from ..utils.chinese_postedit import postedit_traditional_chinese
 from ..utils.model_loader import (
     load_model, get_available_models, unload_current_model, 
     cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS
@@ -251,6 +252,19 @@ class TranslateGemmaNode:
             source_code = detect_source_lang_code(input_text)
             if debug:
                 print(f"[TranslateGemma] Auto-detected source_lang_code={source_code}")
+
+        # Heuristic warning for Chinese script variants: users often set the wrong source variant
+        # (e.g. choose Traditional but provide Simplified input), which can lead to "no-op" output
+        # or script mismatch. Only warn when the user explicitly selected a Chinese variant.
+        if source_language != "Auto Detect" and source_code in {"zh", "zh_Hant"}:
+            detected_variant = detect_source_lang_code(input_text, fallback=source_code)
+            if detected_variant in {"zh", "zh_Hant"} and detected_variant != source_code:
+                print(
+                    "[TranslateGemma] WARNING: source_language may not match the input script. "
+                    f"selected_source_lang_code={source_code}, detected_source_lang_code={detected_variant}. "
+                    "If you want Simplified↔Traditional conversion, set source_language=Auto Detect (recommended) "
+                    "or select the correct Chinese variant explicitly."
+                )
         
         # Load model and processor/tokenizer
         t_load_start = time.time()
@@ -549,7 +563,10 @@ class TranslateGemmaNode:
                 translated_text = processor.decode(generated_ids, skip_special_tokens=True)
             else:
                 translated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            
+
+            translated_text = postedit_traditional_chinese(
+                translated_text.strip(), target_lang_code=target_code, debug=debug
+            )
             return (translated_text.strip(),)
         except Exception as e:
             # TG-008: Include context in inference errors
@@ -827,9 +844,13 @@ class TranslateGemmaNode:
                     truncate_input=truncate_input,
                     strict_context_limit=strict_context_limit,
                     keep_model_loaded=keep_model_loaded,
-                    debug=debug,
+                        debug=debug,
                 )
 
+            # Single-pass output: enforce Traditional script when targeting zh_Hant.
+            image_result = postedit_traditional_chinese(
+                image_result, target_lang_code=target_code, debug=debug
+            )
             return (image_result,)
         except Exception as e:
             cleanup_torch_memory()

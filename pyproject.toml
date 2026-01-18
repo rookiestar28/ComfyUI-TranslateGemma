@@ -25,6 +25,7 @@ dependencies = [
     "accelerate",
     "pillow",
     "langid>=1.1.6",
+    "opencc-python-reimplemented",
 ]
 
 [project.urls]
