@@ -137,6 +137,12 @@ For better Traditional Chinese output consistency, the node maps:
 - Chinese (Simplified) -> `zh`
 - Chinese (Traditional) -> `zh-Hant`
 
+When `source_language=Auto Detect`, the node will try to distinguish Simplified vs Traditional Chinese:
+- Region hints (when available): `zh_TW/zh_HK/zh_MO` -> `zh_Hant`, `zh_CN/zh_SG/zh_MY` -> `zh`
+- Character-variant heuristic: counts common simplified/traditional characters and picks `zh_Hant` only when the signal is strong
+
+If the text is too short or ambiguous, Auto Detect may still resolve to `zh`. For guaranteed behavior, select the desired `source_language` explicitly.
+
 ### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
