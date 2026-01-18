@@ -161,16 +161,13 @@ def preprocess_for_translategemma(
     debug_prefix = f"{resize_mode}_{enhance_mode}"
 
     if resize_mode == "processor":
-        # For processor mode with enhance=true, pre-resize to 896 for deterministic enhancement
+        # For processor mode with enhance=true, pre-resize to 896 for deterministic enhancement.
+        #
+        # NOTE: Official Gemma3ImageProcessor resizes to 896×896 directly (no letterboxing),
+        # per `REFERENCE/translategemma4b/preprocessor_config.json` (`do_resize=true`, `size=896×896`,
+        # `resample=2` => bilinear). To stay consistent, we mimic that behavior here.
         if enhance:
-            # Pre-resize to target size so enhancement is consistent
-            width, height = pil_image.size
-            max_dim = max(width, height)
-            square_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-            offset_x = (max_dim - width) // 2
-            offset_y = (max_dim - height) // 2
-            square_img.paste(pil_image, (offset_x, offset_y))
-            resized_img = square_img.resize((target_size, target_size), Image.LANCZOS)
+            resized_img = pil_image.resize((target_size, target_size), Image.BILINEAR)
         else:
             # No enhancement: just pass through
             resized_img = pil_image
@@ -193,6 +190,15 @@ def preprocess_for_translategemma(
             print(f"[TranslateGemma] Debug image saved (resize): {resized_path}")
         else:
             print("[TranslateGemma] WARNING: Failed to save debug image (resize)")
+        # For processor passthrough, also save a preview of what the *official* processor resize does (896×896).
+        # This helps validate behavior visually without changing runtime semantics.
+        if resize_mode == "processor" and not enhance:
+            preview_img = pil_image.resize((target_size, target_size), Image.BILINEAR)
+            preview_path = _save_debug_image(preview_img, prefix=debug_prefix, label="processor_resized_preview")
+            if preview_path:
+                print(f"[TranslateGemma] Debug image saved (processor preview): {preview_path}")
+            else:
+                print("[TranslateGemma] WARNING: Failed to save debug image (processor preview)")
 
     # 3. Optional enhancement AFTER resize (TG-037: post-resize for consistency)
     if enhance:

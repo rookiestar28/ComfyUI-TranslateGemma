@@ -23,6 +23,11 @@ from ..utils.prompt_builder import (
     build_structured_messages,
 )
 from ..utils.context_utils import compute_effective_limits, suggest_max_new_tokens
+from ..utils.template_guard import (
+    assert_structured_generation_prompt,
+    check_structured_generation_prompt,
+    StructuredTruncationError,
+)
 
 
 # TG-028: Debug privacy controls
@@ -392,6 +397,28 @@ class TranslateGemmaNode:
                             max_tokens=available_for_text,
                         )
                 used_path = "processor.apply_chat_template(structured)"
+
+                # TG-034: Validate structured generation prompt wrapper
+                # Only run guard when truncation occurred (raw > actual)
+                if truncate_input and raw_input_len and actual_input_len and raw_input_len > actual_input_len:
+                    wrapper_ok = check_structured_generation_prompt(tokenizer, inputs["input_ids"])
+                    if not wrapper_ok:
+                        if mode == PromptMode.STRUCTURED:
+                            # Strict mode: fail loudly
+                            raise StructuredTruncationError(
+                                "Structured truncation removed the required generation wrapper. "
+                                "Increase max_input_tokens, disable truncation, or use prompt_mode=plain."
+                            )
+                        else:
+                            # Auto mode: warn and fallback to plain
+                            print(
+                                "[TranslateGemma] WARNING (TG-034): Structured truncation removed "
+                                "required template markers. Falling back to plain prompt."
+                            )
+                            inputs = None  # Trigger fallback
+                            used_path = "unknown"
+        except StructuredTruncationError:
+            raise  # Re-raise guard errors
         except Exception as e:
             if mode == PromptMode.STRUCTURED:
                 raise RuntimeError(
