@@ -13,7 +13,7 @@ import tempfile
 
 # TranslateGemma optimal vision input size (from model card)
 TRANSLATEGEMMA_VISION_SIZE = 896
-DEFAULT_IMAGE_RESIZE_MODE = "processor"  # rely on Gemma3ImageProcessor resize
+DEFAULT_IMAGE_RESIZE_MODE = "letterbox"  # TG-032: aligned with node UI default
 
 
 def preprocess_for_translategemma(

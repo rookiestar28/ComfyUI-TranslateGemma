@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-translategemma"
-description = "ComfyUI node for TranslateGemma — Google's open translation models with 55 languages & multimodal image translation."
+description = "ComfyUI node for TranslateGemma — Google's open source translation models with 55 languages & multimodal image translation."
 version = "1.0.5"
 license = {file = "LICENSE"} 
 # classifiers = [

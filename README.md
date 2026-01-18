@@ -143,6 +143,22 @@ The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` a
 
 If an unsupported language is passed, the node prints a warning and defaults to English. Set `TRANSLATEGEMMA_STRICT_LANG=1` to raise an error instead.
 
+## Default Settings (TG-032)
+
+The following are the authoritative default values for node inputs:
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `model_size` | `4B` | Smallest, fastest |
+| `max_new_tokens` | `512` | Use `0` for auto-sizing |
+| `max_input_tokens` | `2048` | Input truncation limit |
+| `keep_model_loaded` | `true` | Avoids reload overhead |
+| `truncate_input` | `true` | Prevents OOM on long texts |
+| `debug` | `false` | Enable for diagnostics |
+| `image_resize_mode` | `letterbox` | Preserves aspect ratio |
+| `image_enhance` | `false` | Enables contrast/sharpening |
+| `image_two_pass` | `true` | Extract then translate |
+
 ## Performance Tips
 
 - Leave `keep_model_loaded=true` for repeated use (avoids reload time).

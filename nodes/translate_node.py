@@ -579,6 +579,15 @@ class TranslateGemmaNode:
         )
         
         try:
+            # TG-030: Check multimodal capability before attempting
+            if not hasattr(processor, "apply_chat_template"):
+                raise RuntimeError(
+                    f"Image translation requires processor.apply_chat_template, which is missing.\n\n"
+                    f"This usually means your transformers version is too old.\n"
+                    f"Recommended: transformers>=4.57\n\n"
+                    f"[Context] model_size={model_size}, repo_id={repo_id}, cache_dir={_redact_path(cache_dir)}"
+                )
+            
             kwargs = dict(
                 tokenize=True,
                 add_generation_prompt=True,
@@ -606,7 +615,20 @@ class TranslateGemmaNode:
             if debug:
                 print(f"[TranslateGemma] Image path: {_redact_path(tmp_path)} (url-only structured)")
             
-            inputs = processor.apply_chat_template(messages, **kwargs)
+            # TG-030: Wrap apply_chat_template with targeted error handling
+            try:
+                inputs = processor.apply_chat_template(messages, **kwargs)
+            except Exception as template_err:
+                raise RuntimeError(
+                    f"processor.apply_chat_template failed for image translation.\n\n"
+                    f"Error: {type(template_err).__name__}: {template_err}\n\n"
+                    f"Possible causes:\n"
+                    f"- Invalid language codes (source='{source_code}', target='{target_code_for_image}')\n"
+                    f"- Incompatible transformers/processor version\n"
+                    f"- Corrupted image or temp file\n\n"
+                    f"To debug, enable: debug=true + TRANSLATEGEMMA_VERBOSE_DEBUG=1\n"
+                    f"[Context] model_size={model_size}, repo_id={repo_id}"
+                ) from template_err
 
             # Move tensors to the model device; cast only floating tensors to dtype (e.g. pixel values).
             moved_inputs = {}
