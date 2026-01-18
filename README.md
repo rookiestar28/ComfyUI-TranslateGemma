@@ -4,7 +4,7 @@
   <img src="assets/TranslateGemma.png" alt="TranslateGemma" />
 </p>
 
-A ComfyUI integration for TranslateGemma — Google's new open translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
+A ComfyUI integration for TranslateGemma — Google's new open source translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
 
  [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 

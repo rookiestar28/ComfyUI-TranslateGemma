@@ -12,6 +12,7 @@ Reference: 260117-BUNDLE-B_PLAN.md
 
 import os
 import gc
+import threading
 from typing import Optional
 import torch
 from transformers import AutoTokenizer
@@ -28,6 +29,9 @@ MODEL_REPOS = {
     "12B": "google/translategemma-12b-it",
     "27B": "google/translategemma-27b-it",
 }
+
+# TG-029: Thread-safety lock for cache operations
+_MODEL_CACHE_LOCK = threading.RLock()
 
 # Single-model cache (TG-004: only one model in memory at a time)
 _current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
@@ -403,23 +407,25 @@ def unload_current_model():
     Unload the currently loaded model and free memory (TG-004).
     
     This ensures only one model is in memory at a time.
+    TG-029: Thread-safe with _MODEL_CACHE_LOCK.
     """
     global _current_model, _current_model_size
     
-    if _current_model is not None:
-        model, processor_or_tokenizer = _current_model
-        model_size = _current_model_size
-        
-        # Clear references
-        _current_model = None
-        _current_model_size = None
-        del model
-        del processor_or_tokenizer
-        
-        # Clean up memory
-        cleanup_torch_memory()
-        
-        print(f"[TranslateGemma] {model_size} model unloaded, memory cleaned")
+    with _MODEL_CACHE_LOCK:
+        if _current_model is not None:
+            model, processor_or_tokenizer = _current_model
+            model_size = _current_model_size
+            
+            # Clear references
+            _current_model = None
+            _current_model_size = None
+            del model
+            del processor_or_tokenizer
+            
+            # Clean up memory
+            cleanup_torch_memory()
+            
+            print(f"[TranslateGemma] {model_size} model unloaded, memory cleaned")
 
 
 def _detect_auth_error(error: Exception) -> bool:
@@ -510,14 +516,16 @@ def load_model(
     if env_revision and not revision:
         revision = env_revision
     
-    # Return cached model if same size is requested
-    if _current_model is not None and _current_model_size == model_size:
-        print(f"[TranslateGemma] Using cached {model_size} model")
-        return _current_model
-    
-    # Unload current model before loading new one (single-model cache)
-    if _current_model is not None:
-        print(f"[TranslateGemma] Switching from {_current_model_size} to {model_size}")
+    # TG-029: Thread-safe cache check and switch
+    with _MODEL_CACHE_LOCK:
+        # Return cached model if same size is requested
+        if _current_model is not None and _current_model_size == model_size:
+            print(f"[TranslateGemma] Using cached {model_size} model")
+            return _current_model
+        
+        # Unload current model before loading new one (single-model cache)
+        if _current_model is not None:
+            print(f"[TranslateGemma] Switching from {_current_model_size} to {model_size}")
         unload_current_model()
     
     repo_id = MODEL_REPOS.get(model_size)
@@ -605,9 +613,11 @@ def load_model(
         # TG-007: Set model to eval mode for inference
         model.eval()
 
-        # Cache the loaded model (single-model cache)
-        _current_model = (model, processor)
-        _current_model_size = model_size
+        # TG-029: Thread-safe cache write
+        with _MODEL_CACHE_LOCK:
+            # Cache the loaded model (single-model cache)
+            _current_model = (model, processor)
+            _current_model_size = model_size
 
         print(f"[TranslateGemma] {model_size} model loaded successfully on {device} (eval mode)")
         return model, processor
