@@ -124,7 +124,13 @@ For image translation, the node supports multiple preprocessing modes via `image
 - `processor`: rely on the official Gemma3 image processor resize to **896×896** (may stretch)
 - `stretch`: force resize to **896×896** (may distort)
 
-If small text is missed, try enabling `image_enhance=true` to apply mild pixel-only enhancement.
+If small text is missed, try enabling `image_enhance=true` to apply mild pixel-only enhancement (TG-037).
+
+**Enhancement tuning (experimental)**:
+
+- `TRANSLATEGEMMA_IMAGE_ENHANCE_MODE`: `gentle` (default) or `legacy`
+- `TRANSLATEGEMMA_IMAGE_ENHANCE_CONTRAST`: contrast factor (default `1.10`)
+- `TRANSLATEGEMMA_IMAGE_ENHANCE_SHARPNESS`: sharpness factor (default `1.10`)
 
 When `debug=true`, the node prints the path of the preprocessed temporary PNG and keeps it for inspection.
 
@@ -138,6 +144,7 @@ For better Traditional Chinese output consistency, the node maps:
 - Chinese (Traditional) -> `zh-Hant`
 
 When `source_language=Auto Detect`, the node will try to distinguish Simplified vs Traditional Chinese:
+
 - Region hints (when available): `zh_TW/zh_HK/zh_MO` -> `zh_Hant`, `zh_CN/zh_SG/zh_MY` -> `zh`
 - Character-variant heuristic: counts common simplified/traditional characters and picks `zh_Hant` only when the signal is strong
 
@@ -146,6 +153,7 @@ If the text is too short or ambiguous, Auto Detect may still resolve to `zh`. Fo
 Tip: If your input is Simplified Chinese but you want Traditional output, set `source_language=Auto Detect` (or `Chinese (Simplified)`) and `target_language=Chinese (Traditional)`.
 
 If you still see mixed Simplified/Traditional output when targeting Traditional Chinese, you can enable a best-effort post-edit conversion using OpenCC:
+
 - Install: `pip install opencc-python-reimplemented`
 - Default behavior: when `target_language=Chinese (Traditional)` the node will convert Simplified → Traditional if OpenCC is available
 - Disable: set `TRANSLATEGEMMA_TRADITIONAL_POSTEDIT=0`
