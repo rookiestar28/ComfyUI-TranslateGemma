@@ -2,6 +2,7 @@ import torch
 import os
 import tempfile
 import time
+import threading
 from typing import Any
 from ..utils.language_utils import get_language_names, get_language_code
 from ..utils.language_detect import detect_source_lang_code
@@ -24,6 +25,9 @@ from ..utils.context_utils import compute_effective_limits, suggest_max_new_toke
 
 
 # TG-028: Debug privacy controls
+_TOKENIZER_MUTATION_LOCK = threading.RLock()
+
+
 def _is_verbose_debug() -> bool:
     """Check if verbose debug mode is enabled (TG-028)."""
     return os.environ.get("TRANSLATEGEMMA_VERBOSE_DEBUG", "").strip() == "1"
@@ -43,6 +47,26 @@ def _redact_text(text: str, max_len: int = 50) -> str:
     if not text:
         return "(empty)"
     return f"[{len(text)} chars]"
+
+
+# TG-003 (Critical bug fix / Case T3):
+# Do not truncate the full structured chat template produced by
+# `processor.apply_chat_template(...)`. The official template (see
+# `REFERENCE/translategemma4b/chat_template.jinja`) relies on tail markers like
+# `<end_of_turn>` and the generation prompt `<start_of_turn>model\n`.
+# If truncation removes those markers, the model may continue the user text
+# (often in the source language), causing target-language drift.
+def _truncate_text_tokens_to_fit(
+    tokenizer,
+    text: str,
+    max_tokens: int,
+) -> tuple[str, int, bool]:
+    text_ids = tokenizer(text, add_special_tokens=False).get("input_ids", [])
+    if len(text_ids) <= int(max_tokens):
+        return text, len(text_ids), False
+    truncated_ids = text_ids[: int(max_tokens)]
+    truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
+    return truncated_text, len(text_ids), True
 
 
 class TranslateGemmaNode:
@@ -132,7 +156,7 @@ class TranslateGemmaNode:
                     "min": 64,
                     "max": 8192,
                     "step": 64,
-                    "tooltip": "Maximum input tokens (prompt will be truncated if exceeded)",
+                    "tooltip": "(TG-003) Maximum input tokens. Long inputs will be truncated (may reduce translation completeness). Low values like 512 are for stress-testing; recommended 2048+ for long documents.",
                 }),
                 "truncate_input": ("BOOLEAN", {
                     "default": True,
@@ -280,23 +304,79 @@ class TranslateGemmaNode:
         used_path = "unknown"
         inputs = None
         raw_input_len = None
+        actual_input_len = None
         try:
             if mode != PromptMode.PLAIN and hasattr(processor, "apply_chat_template"):
-                messages = build_structured_messages(
-                    input_text=input_text,
-                    target_lang_code=target_code,
-                    source_lang_code=source_code,
-                )
-                kwargs = dict(
+                kwargs_base = dict(
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=True,
                     return_tensors="pt",
                 )
-                if truncate_input:
-                    kwargs.update(dict(truncation=True, max_length=max_input_tokens))
-                inputs = processor.apply_chat_template(messages, **kwargs)
-                raw_input_len = int(inputs["input_ids"].shape[1])
+
+                # IMPORTANT: Avoid truncating the whole templated prompt. If truncation cuts off the
+                # end-of-turn + generation prompt tokens, the model may continue the user's text
+                # (often in the source language), causing target-language drift (Case T3).
+                # Instead, truncate only the user-provided text so the template wrapper remains intact.
+                with _TOKENIZER_MUTATION_LOCK:
+                    overhead_messages = build_structured_messages(
+                        input_text="",
+                        target_lang_code=target_code,
+                        source_lang_code=source_code,
+                    )
+                    overhead_inputs = processor.apply_chat_template(overhead_messages, **kwargs_base)
+                    overhead_len = int(overhead_inputs["input_ids"].shape[1])
+                    available_for_text = int(max_input_tokens) - overhead_len
+
+                    _, raw_text_tokens, _ = _truncate_text_tokens_to_fit(
+                        tokenizer=tokenizer,
+                        text=input_text,
+                        max_tokens=10**9,
+                    )
+                    raw_input_len = overhead_len + int(raw_text_tokens)
+
+                    if truncate_input and int(max_input_tokens) <= overhead_len:
+                        raise RuntimeError(
+                            "max_input_tokens is too low for the official structured chat template. "
+                            f"(max_input_tokens={max_input_tokens}, template_overhead_tokens={overhead_len}) "
+                            "Increase max_input_tokens or use prompt_mode=plain."
+                        )
+
+                    truncated_text = input_text
+                    if truncate_input and raw_input_len > int(max_input_tokens) and available_for_text > 0:
+                        truncated_text, _, _ = _truncate_text_tokens_to_fit(
+                            tokenizer=tokenizer,
+                            text=input_text,
+                            max_tokens=available_for_text,
+                        )
+
+                    if debug and truncate_input and raw_input_len > int(max_input_tokens):
+                        print(
+                            "[TranslateGemma] Structured truncation: "
+                            f"overhead_tokens={overhead_len}, "
+                            f"available_for_text_tokens={max(available_for_text, 0)}, "
+                            f"raw_input_tokens={raw_input_len}, max_input_tokens={max_input_tokens}"
+                        )
+
+                    for _ in range(8):
+                        messages = build_structured_messages(
+                            input_text=truncated_text,
+                            target_lang_code=target_code,
+                            source_lang_code=source_code,
+                        )
+                        inputs = processor.apply_chat_template(messages, **kwargs_base)
+                        actual_input_len = int(inputs["input_ids"].shape[1])
+                        if actual_input_len <= int(max_input_tokens) or not truncate_input:
+                            break
+                        overflow = actual_input_len - int(max_input_tokens)
+                        available_for_text = max(available_for_text - overflow - 8, 0)
+                        if available_for_text <= 0:
+                            break
+                        truncated_text, _, _ = _truncate_text_tokens_to_fit(
+                            tokenizer=tokenizer,
+                            text=input_text,
+                            max_tokens=available_for_text,
+                        )
                 used_path = "processor.apply_chat_template(structured)"
         except Exception as e:
             if mode == PromptMode.STRUCTURED:
@@ -327,32 +407,57 @@ class TranslateGemmaNode:
                     preview = prompt[:50] + "..." + prompt[-50:] if len(prompt) > 100 else prompt
                     print(f"[TranslateGemma] Prompt preview: {preview}")
 
-            probe_max = max_input_tokens + 1024
-            probe_result = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=probe_max,
-            )
-            raw_input_len = int(probe_result["input_ids"].shape[1])
-
             if truncate_input:
-                inputs = tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_input_tokens,
-                )
+                with _TOKENIZER_MUTATION_LOCK:
+                    old_truncation_side = getattr(tokenizer, "truncation_side", None)
+                    if old_truncation_side and old_truncation_side != "right":
+                        if debug:
+                            print(
+                                "[TranslateGemma] Forcing tokenizer.truncation_side='right' "
+                                "(to preserve instruction tokens under truncation)"
+                            )
+                        tokenizer.truncation_side = "right"
+                    try:
+                        inputs = tokenizer(
+                            prompt,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=max_input_tokens,
+                        )
+                        actual_input_len = int(inputs["input_ids"].shape[1])
+                        raw_input_len = actual_input_len
+
+                        if actual_input_len == int(max_input_tokens):
+                            probe_max = int(max_input_tokens) + 1024
+                            probe_result = tokenizer(
+                                prompt,
+                                return_tensors="pt",
+                                truncation=True,
+                                max_length=probe_max,
+                            )
+                            raw_input_len = int(probe_result["input_ids"].shape[1])
+                    finally:
+                        if old_truncation_side and old_truncation_side != tokenizer.truncation_side:
+                            tokenizer.truncation_side = old_truncation_side
             else:
                 inputs = tokenizer(prompt, return_tensors="pt")
+                actual_input_len = int(inputs["input_ids"].shape[1])
+                raw_input_len = actual_input_len
 
             used_path = "tokenizer(prompt)"
 
-        actual_input_len = int(inputs["input_ids"].shape[1])
+        actual_input_len = actual_input_len or int(inputs["input_ids"].shape[1])
+        raw_input_len = raw_input_len or actual_input_len
         if debug:
             print(
                 f"[TranslateGemma] Text path: {used_path}, "
                 f"raw_input_tokens={raw_input_len}, actual_input_tokens={actual_input_len}"
+            )
+
+        if truncate_input and raw_input_len and actual_input_len and int(raw_input_len) > int(actual_input_len):
+            print(
+                f"[TranslateGemma] Input truncated from {raw_input_len} to {actual_input_len} tokens "
+                f"(max_input_tokens={max_input_tokens}, template-safe)"
             )
 
         requested_max_new_tokens = max_new_tokens
@@ -367,7 +472,7 @@ class TranslateGemmaNode:
         # Compute effective limits (TG-003)
         limits = compute_effective_limits(
             tokenizer=tokenizer,
-            input_len=int(raw_input_len),
+            input_len=int(actual_input_len),
             max_new_tokens=int(requested_max_new_tokens),
             max_input_tokens=max_input_tokens,
             strict_context_limit=strict_context_limit,
