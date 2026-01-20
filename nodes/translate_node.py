@@ -12,6 +12,7 @@ from ..utils.image_preprocess import (
     cleanup_temp_image,
 )
 from ..utils.chinese_postedit import postedit_traditional_chinese
+from ..utils.chinese_convert import convert_chinese_variants, is_chinese_variant_code, infer_chinese_variant
 from ..utils.model_loader import (
     load_model, get_available_models, unload_current_model, 
     cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS
@@ -180,6 +181,14 @@ class TranslateGemmaNode:
                     "default": False,
                     "tooltip": "Enable debug logging for prompt construction and tokenizer probing",
                 }),
+                "chinese_conversion_only": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "(TG-038) Use OpenCC for Chinese Simplified/Traditional conversion only (no model load).",
+                }),
+                "chinese_conversion_direction": (["auto_flip", "to_traditional", "to_simplified"], {
+                    "default": "auto_flip",
+                    "tooltip": "(TG-038) Conversion direction: auto_flip (detect input variant and flip), to_traditional (force s2t), to_simplified (force t2s).",
+                }),
             },
         }
     
@@ -193,7 +202,7 @@ class TranslateGemmaNode:
         image_resize_mode: str = "letterbox",
         image_two_pass: bool = True,
         source_language: str = "Auto Detect",
-        external_text: str = None,
+        external_text: str | None = None,
         prompt_mode: str = "auto",
         max_new_tokens: int = 512,
         max_input_tokens: int = 2048,
@@ -201,6 +210,8 @@ class TranslateGemmaNode:
         strict_context_limit: bool = True,
         keep_model_loaded: bool = True,
         debug: bool = False,
+        chinese_conversion_only: bool = False,
+        chinese_conversion_direction: str = "auto_flip",
     ) -> tuple[str]:
         """
         Translate text to target language using TranslateGemma.
@@ -221,10 +232,22 @@ class TranslateGemmaNode:
             truncate_input: Whether to truncate long inputs (TG-003)
             strict_context_limit: Clamp output to fit context (TG-003)
             debug: Enable debug logging
-            
+            chinese_conversion_only: Use OpenCC for Chinese conversion only (TG-038)
+            chinese_conversion_direction: Conversion direction for TG-038 (auto_flip/to_traditional/to_simplified)
+
         Returns:
             Tuple containing translated text
         """
+        # TG-038: Fast-path for Chinese conversion-only mode (no model load)
+        if chinese_conversion_only:
+            return self._convert_chinese_only(
+                text=text,
+                external_text=external_text,
+                image=image,
+                conversion_direction=chinese_conversion_direction,
+                debug=debug,
+            )
+
         if image is not None:
             return self._translate_image(
                 image=image,
@@ -401,7 +424,8 @@ class TranslateGemmaNode:
                 # TG-034: Validate structured generation prompt wrapper
                 # Only run guard when truncation occurred (raw > actual)
                 if truncate_input and raw_input_len and actual_input_len and raw_input_len > actual_input_len:
-                    wrapper_ok = check_structured_generation_prompt(tokenizer, inputs["input_ids"])
+                    input_ids = inputs["input_ids"] if inputs else None
+                    wrapper_ok = check_structured_generation_prompt(tokenizer, input_ids) if input_ids is not None else False
                     if not wrapper_ok:
                         if mode == PromptMode.STRUCTURED:
                             # Strict mode: fail loudly
@@ -744,7 +768,8 @@ class TranslateGemmaNode:
                 return_tensors="pt",
             )
             if truncate_input:
-                kwargs.update(dict(truncation=True, max_length=effective_max_input_tokens))
+                kwargs["truncation"] = True
+                kwargs["max_length"] = int(effective_max_input_tokens)
 
             # TG-025: Use url-only path (matches official examples)
             messages = [
@@ -864,7 +889,7 @@ class TranslateGemmaNode:
                     image_enhance=False,
                     image_two_pass=False,
                     source_language=source_language,
-                    external_text=None,
+                    external_text="",
                     prompt_mode="auto",
                     max_new_tokens=max_new_tokens,
                     max_input_tokens=max_input_tokens,
@@ -895,6 +920,112 @@ class TranslateGemmaNode:
             cleanup_temp_image(tmp_path, keep_for_debug=debug)
             if not keep_model_loaded:
                 unload_current_model()
+
+    def _convert_chinese_only(
+        self,
+        text: str,
+        external_text: str | None,
+        image,
+        conversion_direction: str,
+        debug: bool,
+    ) -> tuple[str]:
+        """
+        TG-038: Fast-path Chinese variant conversion using OpenCC (no model load).
+
+        This method performs deterministic Simplified ↔ Traditional conversion
+        without loading any translation model. It uses OpenCC's phrase-level
+        dictionaries followed by character-level fallback.
+
+        Args:
+            text: Text from the built-in input field
+            external_text: Optional external text input
+            image: Image input (must be None for conversion-only)
+            conversion_direction: Direction selector (auto_flip/to_traditional/to_simplified)
+            debug: Enable debug logging
+
+        Returns:
+            Tuple containing converted text
+        """
+        # Reject image input for conversion-only mode
+        if image is not None:
+            return (
+                "[Error: chinese_conversion_only mode is text-only. "
+                "Disconnect the image input to use conversion-only mode, "
+                "or disable chinese_conversion_only for image translation.]",
+            )
+
+        # TG-009: Use external text if connected (is not None), otherwise use built-in text
+        input_text = external_text if external_text is not None else text
+
+        if not input_text or not input_text.strip():
+            return ("",)
+
+        # Determine target_lang_code based on conversion_direction
+        target_code: str | None = None
+
+        if conversion_direction == "to_traditional":
+            target_code = "zh_Hant"
+            if debug:
+                print("[TranslateGemma] Conversion-only: forced direction → Traditional (s2t)")
+
+        elif conversion_direction == "to_simplified":
+            target_code = "zh"
+            if debug:
+                print("[TranslateGemma] Conversion-only: forced direction → Simplified (t2s)")
+
+        elif conversion_direction == "auto_flip":
+            # Auto-detect input variant and flip to opposite
+            try:
+                inferred_variant = infer_chinese_variant(input_text, debug=debug)
+            except ImportError as e:
+                return (f"[Error: {e}]",)
+
+            if inferred_variant is None:
+                # Ambiguous input
+                return (
+                    "[Error: Input variant ambiguous. Cannot determine if text is "
+                    "Simplified or Traditional Chinese.\n"
+                    "Select chinese_conversion_direction='to_traditional' or 'to_simplified' "
+                    "to force direction.]",
+                )
+
+            # Flip: if input is Simplified → output Traditional, and vice versa
+            if inferred_variant == "zh":
+                target_code = "zh_Hant"
+                if debug:
+                    print(
+                        "[TranslateGemma] Conversion-only auto_flip: "
+                        "detected Simplified → converting to Traditional"
+                    )
+            else:  # zh_Hant
+                target_code = "zh"
+                if debug:
+                    print(
+                        "[TranslateGemma] Conversion-only auto_flip: "
+                        "detected Traditional → converting to Simplified"
+                    )
+        else:
+            return (
+                f"[Error: Invalid chinese_conversion_direction='{conversion_direction}'. "
+                f"Expected 'auto_flip', 'to_traditional', or 'to_simplified'.]",
+            )
+
+        # Perform conversion
+        try:
+            converted = convert_chinese_variants(
+                text=input_text,
+                target_lang_code=target_code,
+                debug=debug,
+            )
+            return (converted.strip(),)
+        except ImportError as e:
+            # OpenCC not installed
+            return (f"[Error: {e}]",)
+        except ValueError as e:
+            # Invalid target language
+            return (f"[Error: {e}]",)
+        except Exception as e:
+            return (f"[Error: Chinese conversion failed: {e}]",)
 
     @staticmethod
     def _comfy_image_to_pil(image: Any):

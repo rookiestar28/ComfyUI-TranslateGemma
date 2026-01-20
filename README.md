@@ -8,6 +8,15 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 
  [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 
+ ---
+
+**01/2026 update**:
+Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
+
+新增 `chinese_conversion_only` 和 `chinese_conversion_direction`，以便通過 OpenCC 快速進行簡體與繁體的轉換（無需模型載入）。
+
+---
+
 ## Features
 
 - Text translation across 55 languages
@@ -15,6 +24,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - First-run auto download via Hugging Face (requires accepting Gemma terms)
 - Flexible inputs: built-in text box + external string input
 - Optional image input: translate text found in images (multimodal)
+- Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model (TG-038)
 
 ## Installation
 
@@ -97,6 +107,8 @@ Category: `text/translation`
 | `strict_context_limit` | BOOLEAN | Clamp output so input + output fits the model context |
 | `keep_model_loaded` | BOOLEAN | Keep the model in memory between runs |
 | `debug` | BOOLEAN | Enable debug logging |
+| `chinese_conversion_only` | BOOLEAN | Use OpenCC for Chinese Simplified/Traditional conversion only (no model load) |
+| `chinese_conversion_direction` | COMBO | Conversion direction: `auto_flip` / `to_traditional` / `to_simplified` (default: `auto_flip`) |
 
 ### Outputs
 
@@ -162,6 +174,40 @@ If you still see mixed Simplified/Traditional output when targeting Traditional 
 - Default behavior: when `target_language=Chinese (Traditional)` the node will convert Simplified → Traditional if OpenCC is available
 - Disable: set `TRANSLATEGEMMA_TRADITIONAL_POSTEDIT=0`
 
+### Chinese Conversion-Only Mode (TG-038)
+
+For workflows that only need **script conversion** (Simplified ↔ Traditional) without translation, enable `chinese_conversion_only=true`. This mode:
+
+- Uses OpenCC for fast, deterministic conversion
+- **Does not load any translation model** (no GPU/VRAM required)
+- Returns converted text immediately with minimal latency
+- Does **not** require `target_language` to be a Chinese variant (direction is controlled separately)
+
+**Direction selector** (`chinese_conversion_direction`):
+
+- `auto_flip` (default): Auto-detect input variant and convert to the **opposite** script
+  - Input Simplified → output Traditional
+  - Input Traditional → output Simplified
+  - Returns an error if input is ambiguous (ask user to force direction)
+- `to_traditional`: Force Simplified → Traditional (`s2t`)
+- `to_simplified`: Force Traditional → Simplified (`t2s`)
+
+**Requirements:**
+
+- Install OpenCC: `pip install opencc-python-reimplemented`
+
+**Limitations:**
+
+- Text-only: if `image` is connected, returns an error (use normal translation mode for images)
+- No cross-language translation (e.g., English → Chinese still requires the model)
+- `auto_flip` may fail on short/ambiguous inputs; use forced direction in those cases
+
+**When to use:**
+
+- You have Chinese text and only need to change the script variant
+- You want to avoid model download/load overhead
+- You need deterministic, reproducible output (no LLM randomness)
+
 ### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
@@ -183,6 +229,8 @@ The following are the authoritative default values for node inputs:
 | `image_resize_mode` | `letterbox` | Preserves aspect ratio |
 | `image_enhance` | `false` | Enables contrast/sharpening |
 | `image_two_pass` | `true` | Extract then translate |
+| `chinese_conversion_only` | `false` | OpenCC conversion without model |
+| `chinese_conversion_direction` | `auto_flip` | Auto-detect and flip variant |
 
 ## Performance Tips
 
