@@ -8,6 +8,7 @@ Provides helpers for:
 Reference: TG-003 Implementation Plan
 """
 
+import os
 from typing import Optional
 
 # Default context limit when tokenizer reports unreliable value
@@ -19,10 +20,21 @@ MAX_REASONABLE_CONTEXT = 100_000
 DEFAULT_AUTO_MAX_NEW_TOKENS = 1024
 
 
+def _get_env_int(name: str, default: int, min_val: int, max_val: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+        return max(min_val, min(max_val, val))
+    except ValueError:
+        return default
+
+
 def suggest_max_new_tokens(
     input_len: int,
     min_suggested: int = 64,
-    max_suggested: int = DEFAULT_AUTO_MAX_NEW_TOKENS,
+    max_suggested: Optional[int] = None,
 ) -> int:
     """
     Suggest a reasonable max_new_tokens value for translation-style tasks.
@@ -31,6 +43,8 @@ def suggest_max_new_tokens(
     latency and can amplify repetition) while leaving enough room for typical
     translations. Users can always override by setting max_new_tokens > 0.
     """
+    if max_suggested is None:
+        max_suggested = DEFAULT_AUTO_MAX_NEW_TOKENS
     safe_input_len = max(int(input_len or 0), 0)
     suggested = int(safe_input_len * 1.25 + 32)
     return max(min_suggested, min(max_suggested, suggested))

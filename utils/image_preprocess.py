@@ -6,13 +6,18 @@ This module provides deterministic preprocessing to meet these requirements.
 """
 
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from pathlib import Path
 from typing import Optional
 import os
 import tempfile
+import uuid
+
+from .runtime_constants import VISION_TARGET_SIZE
+from .debug_utils import redact_path
 
 
-# TranslateGemma optimal vision input size (from model card)
-TRANSLATEGEMMA_VISION_SIZE = 896
+# TG-040: Use centralized vision size constant
+TRANSLATEGEMMA_VISION_SIZE = VISION_TARGET_SIZE
 DEFAULT_IMAGE_RESIZE_MODE = "letterbox"  # TG-032: aligned with node UI default
 
 
@@ -84,6 +89,40 @@ def _apply_enhancement(img: Image.Image, debug: bool = False) -> Image.Image:
         return _apply_enhancement_gentle(img, contrast=contrast, sharpness=sharpness)
 
 
+def _find_repo_root(start: Path) -> Path:
+    """
+    Best-effort repo root discovery for debug artifacts.
+
+    Prefer a directory that contains `pyproject.toml` or `requirements.txt`.
+    Fallback: use the parent of `utils/`.
+    """
+    for p in [start, *start.parents][:8]:
+        if (p / "pyproject.toml").exists() or (p / "requirements.txt").exists():
+            return p
+    return start.parent
+
+
+def _save_debug_image(img: Image.Image, prefix: str, label: str) -> Optional[str]:
+    """
+    Save a debug image under `<repo_root>/debug/`.
+
+    Returns the saved path string, or None if saving fails.
+    """
+    try:
+        repo_root = _find_repo_root(Path(__file__).resolve())
+        debug_dir = repo_root / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_prefix = (prefix or "unknown").replace(" ", "_")
+        safe_label = (label or "image").replace(" ", "_")
+        filename = f"{safe_prefix}_{safe_label}_{uuid.uuid4().hex[:10]}.png"
+        out_path = debug_dir / filename
+        img.save(str(out_path), format="PNG")
+        return str(out_path)
+    except Exception:
+        return None
+
+
 def preprocess_for_translategemma(
     pil_image: Image.Image,
     target_size: int = TRANSLATEGEMMA_VISION_SIZE,
@@ -110,7 +149,7 @@ def preprocess_for_translategemma(
         Preprocessed PIL Image (RGB, target_size×target_size or original if processor)
     """
     original_size = pil_image.size
-    
+
     # 1. Ensure RGB (drop alpha if present)
     if pil_image.mode != "RGB":
         pil_image = pil_image.convert("RGB")
@@ -120,17 +159,18 @@ def preprocess_for_translategemma(
     if resize_mode not in {"processor", "letterbox", "stretch"}:
         raise ValueError(f"Invalid resize_mode: {resize_mode}")
 
+    enhance_params = _get_enhance_params() if enhance else {}
+    enhance_mode = enhance_params.get("mode", "none") if enhance else "none"
+    debug_prefix = f"{resize_mode}_{enhance_mode}"
+
     if resize_mode == "processor":
-        # For processor mode with enhance=true, pre-resize to 896 for deterministic enhancement
+        # For processor mode with enhance=true, pre-resize to 896 for deterministic enhancement.
+        #
+        # NOTE: Official Gemma3ImageProcessor resizes to 896×896 directly (no letterboxing),
+        # per `REFERENCE/translategemma4b/preprocessor_config.json` (`do_resize=true`, `size=896×896`,
+        # `resample=2` => bilinear). To stay consistent, we mimic that behavior here.
         if enhance:
-            # Pre-resize to target size so enhancement is consistent
-            width, height = pil_image.size
-            max_dim = max(width, height)
-            square_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-            offset_x = (max_dim - width) // 2
-            offset_y = (max_dim - height) // 2
-            square_img.paste(pil_image, (offset_x, offset_y))
-            resized_img = square_img.resize((target_size, target_size), Image.LANCZOS)
+            resized_img = pil_image.resize((target_size, target_size), Image.BILINEAR)
         else:
             # No enhancement: just pass through
             resized_img = pil_image
@@ -145,13 +185,36 @@ def preprocess_for_translategemma(
         square_img.paste(pil_image, (offset_x, offset_y))
         resized_img = square_img.resize((target_size, target_size), Image.LANCZOS)
 
+    # Save the "resize-only" intermediate for visual inspection when debug is enabled.
+    if debug:
+        resized_label = "resized" if resize_mode != "processor" or enhance else "processor_passthrough"
+        resized_path = _save_debug_image(resized_img, prefix=debug_prefix, label=resized_label)
+        if resized_path:
+            print(f"[TranslateGemma] Debug image saved (resize): {redact_path(resized_path)}")
+        else:
+            print("[TranslateGemma] WARNING: Failed to save debug image (resize)")
+        # For processor passthrough, also save a preview of what the *official* processor resize does (896×896).
+        # This helps validate behavior visually without changing runtime semantics.
+        if resize_mode == "processor" and not enhance:
+            preview_img = pil_image.resize((target_size, target_size), Image.BILINEAR)
+            preview_path = _save_debug_image(preview_img, prefix=debug_prefix, label="processor_resized_preview")
+            if preview_path:
+                print(f"[TranslateGemma] Debug image saved (processor preview): {redact_path(preview_path)}")
+            else:
+                print("[TranslateGemma] WARNING: Failed to save debug image (processor preview)")
+
     # 3. Optional enhancement AFTER resize (TG-037: post-resize for consistency)
     if enhance:
         resized_img = _apply_enhancement(resized_img, debug=debug)
+        if debug:
+            enhanced_path = _save_debug_image(resized_img, prefix=debug_prefix, label="enhanced")
+            if enhanced_path:
+                print(f"[TranslateGemma] Debug image saved (enhance): {redact_path(enhanced_path)}")
+            else:
+                print("[TranslateGemma] WARNING: Failed to save debug image (enhance)")
 
     if debug:
-        params = _get_enhance_params() if enhance else {}
-        mode_str = params.get("mode", "N/A") if enhance else "N/A"
+        mode_str = enhance_params.get("mode", "N/A") if enhance else "N/A"
         if resize_mode == "processor" and not enhance:
             print(
                 f"[TranslateGemma] Image preprocessing: "
@@ -191,7 +254,7 @@ def save_preprocessed_image(
     pil_image.save(tmp_path, format="PNG")
     
     if debug:
-        print(f"[TranslateGemma] Preprocessed image saved: {tmp_path}")
+        print(f"[TranslateGemma] Preprocessed image saved: {redact_path(tmp_path)}")
         if keep_file:
             print(f"[TranslateGemma] Debug mode: keeping file for inspection")
     

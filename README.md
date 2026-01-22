@@ -8,6 +8,15 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 
  [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 
+ ---
+
+**01/2026 update**:
+Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
+
+新增 `chinese_conversion_only` 和 `chinese_conversion_direction`，以便通過 OpenCC 快速進行簡體與繁體的轉換（無需模型載入）。
+
+---
+
 ## Features
 
 - Text translation across 55 languages
@@ -15,6 +24,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - First-run auto download via Hugging Face (requires accepting Gemma terms)
 - Flexible inputs: built-in text box + external string input
 - Optional image input: translate text found in images (multimodal)
+- Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model (TG-038)
 
 ## Installation
 
@@ -26,21 +36,21 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 
 ### Option B: Manual
 
-1) Clone into your ComfyUI `custom_nodes` directory:
+1) Clone into your ComfyUI `custom_nodes` directory (from your ComfyUI root):
 
 ```bash
-cd ComfyUI/custom_nodes
+cd custom_nodes
 git clone https://github.com/rookiestar28/ComfyUI-TranslateGemma.git
 ```
 
-1) Install dependencies:
+2) Install dependencies:
 
 ```bash
 cd ComfyUI-TranslateGemma
 pip install -r requirements.txt
 ```
 
-1) Restart ComfyUI.
+3) Restart ComfyUI.
 
 ## Hugging Face Access (Gated Models)
 
@@ -69,6 +79,9 @@ Alternatively, set one of these environment variables for the ComfyUI process:
 
 Models are stored under ComfyUI's models directory in a per-repo folder:
 
+- Preferred: `ComfyUI/models/LLM/TranslateGemma/<repo_name>/`
+- Fallback (legacy): `ComfyUI/models/translate_gemma/<repo_name>/`
+
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-4b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-12b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-27b-it/`
@@ -81,22 +94,24 @@ Category: `text/translation`
 
 | Name | Type | Description |
 |------|------|-------------|
-| `text` | STRING | Built-in text input (multiline) |
-| `external_text` | STRING | Optional external input; when connected, **overrides** `text` (even if empty) |
-| `image` | IMAGE | Optional image input; when connected, translates text found in the image |
-| `image_enhance` | BOOLEAN | Apply mild contrast/sharpening to improve small text visibility in images (default: `false`) |
-| `image_resize_mode` | COMBO | Image preprocessing mode: `letterbox` / `processor` / `stretch` (default: `letterbox`) |
-| `image_two_pass` | BOOLEAN | Two-pass image translation: extract text from image first, then translate extracted text (default: `true`) |
-| `target_language` | COMBO | Target language |
-| `source_language` | COMBO | Source language (default: Auto Detect) |
-| `model_size` | COMBO | 4B / 12B / 27B |
-| `prompt_mode` | COMBO | `auto` / `structured` / `plain` |
-| `max_new_tokens` | INT | Max output tokens (default: 512). Set to `0` for Auto |
-| `max_input_tokens` | INT | Max input tokens (default: 2048) |
-| `truncate_input` | BOOLEAN | Truncate input when it exceeds `max_input_tokens` |
-| `strict_context_limit` | BOOLEAN | Clamp output so input + output fits the model context |
-| `keep_model_loaded` | BOOLEAN | Keep the model in memory between runs |
-| `debug` | BOOLEAN | Enable debug logging |
+| `text` | STRING | Built-in text input (multiline). Ignored when `external_text` is connected. Empty/whitespace returns empty output. |
+| `external_text` | STRING | When connected, **overrides** `text` (even if empty). Intended for chaining from other nodes. |
+| `image` | IMAGE | If connected, uses multimodal path to translate text from the image. Requires explicit `source_language` (Auto Detect is not supported for images). |
+| `image_enhance` | BOOLEAN | Mild contrast/sharpening to help small text visibility; may introduce artifacts (default: `false`). |
+| `image_resize_mode` | COMBO | `letterbox` (preserve aspect ratio, recommended) / `processor` (official resize, may stretch) / `stretch` (force 896×896, may distort). Default: `letterbox`. |
+| `image_two_pass` | BOOLEAN | Extract text from image first, then translate extracted text (more accurate, slower). Default: `true`. |
+| `target_language` | COMBO | Translation target language. Does not affect `chinese_conversion_only=true`. |
+| `source_language` | COMBO | Auto Detect is supported for text only. Images require explicit source language. Default: Auto Detect. |
+| `model_size` | COMBO | 4B (fastest) / 12B / 27B trade-off (speed vs quality vs VRAM). Gated repos require HF authentication. See VRAM Notes below for rough estimates. |
+| `prompt_mode` | COMBO | `auto` (structured first, fallback to plain) / `structured` (fail if unavailable) / `plain` (instruction only). Default: `auto`. |
+| `max_new_tokens` | INT | Maximum output tokens. `0` = Auto (based on input length and remaining context budget). Also clamped by the model context window. Default: 512. |
+| `max_input_tokens` | INT | Input truncation limit. `0` = Auto (reserve room for output within context). Too low can break multimodal inputs/templates. Default: 2048. |
+| `truncate_input` | BOOLEAN | Truncate input if it exceeds `max_input_tokens`. Disable may cause OOM. Default: `true`. |
+| `strict_context_limit` | BOOLEAN | Clamp output so input+output stays within model context window. Default: `true`. |
+| `keep_model_loaded` | BOOLEAN | Keep model in memory for faster repeated use; may keep VRAM allocated. Default: `true`. |
+| `debug` | BOOLEAN | Enable debug logging. Sensitive data redacted by default; set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` for full details. Default: `false`. |
+| `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
+| `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 
 ### Outputs
 
@@ -131,8 +146,13 @@ If small text is missed, try enabling `image_enhance=true` to apply mild pixel-o
 - `TRANSLATEGEMMA_IMAGE_ENHANCE_MODE`: `gentle` (default) or `legacy`
 - `TRANSLATEGEMMA_IMAGE_ENHANCE_CONTRAST`: contrast factor (default `1.10`)
 - `TRANSLATEGEMMA_IMAGE_ENHANCE_SHARPNESS`: sharpness factor (default `1.10`)
+- `TRANSLATEGEMMA_AUTO_MAX_NEW_TOKENS_MAX`: optional hard cap for `max_new_tokens=0` (Auto) to limit long-form outputs. If unset, Auto is only limited by context budget + other safeguards.
 
 When `debug=true`, the node prints the path of the preprocessed temporary PNG and keeps it for inspection.
+
+Additionally, when `debug=true`, the node saves intermediate images under `debug/`:
+- `resize_mode` + `enhance_mode` prefixed files
+- both the resize-only and enhance-applied variants (when enabled)
 
 Note: For image translation, `max_input_tokens` values that are too small can truncate the model’s visual tokens and cause unrelated outputs. The node enforces a safe minimum when truncation is enabled.
 
@@ -158,6 +178,40 @@ If you still see mixed Simplified/Traditional output when targeting Traditional 
 - Default behavior: when `target_language=Chinese (Traditional)` the node will convert Simplified → Traditional if OpenCC is available
 - Disable: set `TRANSLATEGEMMA_TRADITIONAL_POSTEDIT=0`
 
+### Chinese Conversion-Only Mode (TG-038)
+
+For workflows that only need **script conversion** (Simplified ↔ Traditional) without translation, enable `chinese_conversion_only=true`. This mode:
+
+- Uses OpenCC for fast, deterministic conversion
+- **Does not load any translation model** (no GPU/VRAM required)
+- Returns converted text immediately with minimal latency
+- Does **not** require `target_language` to be a Chinese variant (direction is controlled separately)
+
+**Direction selector** (`chinese_conversion_direction`):
+
+- `auto_flip` (default): Auto-detect input variant and convert to the **opposite** script
+  - Input Simplified → output Traditional
+  - Input Traditional → output Simplified
+  - Returns an error if input is ambiguous (ask user to force direction)
+- `to_traditional`: Force Simplified → Traditional (`s2t`)
+- `to_simplified`: Force Traditional → Simplified (`t2s`)
+
+**Requirements:**
+
+- Install OpenCC: `pip install opencc-python-reimplemented`
+
+**Limitations:**
+
+- Text-only: if `image` is connected, returns an error (use normal translation mode for images)
+- No cross-language translation (e.g., English → Chinese still requires the model)
+- `auto_flip` may fail on short/ambiguous inputs; use forced direction in those cases
+
+**When to use:**
+
+- You have Chinese text and only need to change the script variant
+- You want to avoid model download/load overhead
+- You need deterministic, reproducible output (no LLM randomness)
+
 ### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
@@ -172,13 +226,15 @@ The following are the authoritative default values for node inputs:
 |---------|---------|-------|
 | `model_size` | `4B` | Smallest, fastest |
 | `max_new_tokens` | `512` | Use `0` for auto-sizing |
-| `max_input_tokens` | `2048` | Input truncation limit |
+| `max_input_tokens` | `2048` | Input truncation limit (`0` = Auto) |
 | `keep_model_loaded` | `true` | Avoids reload overhead |
 | `truncate_input` | `true` | Prevents OOM on long texts |
 | `debug` | `false` | Enable for diagnostics |
 | `image_resize_mode` | `letterbox` | Preserves aspect ratio |
 | `image_enhance` | `false` | Enables contrast/sharpening |
 | `image_two_pass` | `true` | Extract then translate |
+| `chinese_conversion_only` | `false` | OpenCC conversion without model |
+| `chinese_conversion_direction` | `auto_flip` | Auto-detect and flip variant |
 
 ## Performance Tips
 
@@ -188,9 +244,10 @@ The following are the authoritative default values for node inputs:
 
 ## VRAM Notes (Native Models)
 
-- 4B model: ~12 GB
-- 12B model: ~27 GB
-- 27B model: ~56 GB
+- Rough starting point (varies by GPU, dtype, drivers, and context length):
+  - 4B model: ~12 GB
+  - 12B model: ~27 GB
+  - 27B model: ~56 GB
 
 ## Security / Reproducibility Notes
 

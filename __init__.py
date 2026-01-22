@@ -12,4 +12,4 @@ __version__ = "1.0.9"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 # ComfyUI registration
-WEB_DIRECTORY = None  # No web extensions needed
+WEB_DIRECTORY = "./web"
