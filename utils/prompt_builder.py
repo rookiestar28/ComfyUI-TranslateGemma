@@ -85,12 +85,21 @@ def build_simple_messages(
         List of message dictionaries with string content
     """
     target_name = _get_language_name(target_lang_code)
-    
+
+    # Keep the simple prompt style close to the official template wording to
+    # reduce target-language drift when we must fall back.
     if source_lang_code:
         source_name = _get_language_name(source_lang_code)
-        instruction = f"Translate the following {source_name} text to {target_name}:\n\n{input_text}"
+        instruction = (
+            f"You are a professional {source_name} ({source_lang_code}) to {target_name} ({target_lang_code}) translator.\n"
+            f"Produce only the {target_name} translation, without any additional explanations or commentary.\n\n"
+            f"Please translate the following {source_name} text into {target_name}:\n\n{input_text}"
+        )
     else:
-        instruction = f"Translate the following text to {target_name}:\n\n{input_text}"
+        instruction = (
+            f"Produce only the {target_name} translation, without any additional explanations or commentary.\n\n"
+            f"Please translate the following text into {target_name}:\n\n{input_text}"
+        )
     
     return [{"role": "user", "content": instruction}]
 
@@ -117,9 +126,20 @@ def build_plain_prompt(
     
     if source_lang_code:
         source_name = _get_language_name(source_lang_code)
-        return f"Translate the following {source_name} text to {target_name}:\n\n{input_text}\n\nTranslation:"
+        return (
+            f"You are a professional {source_name} ({source_lang_code}) to {target_name} ({target_lang_code}) translator. "
+            f"Your goal is to accurately convey the meaning and nuances of the original {source_name} text while adhering to "
+            f"{target_name} grammar, vocabulary, and cultural sensitivities.\n\n"
+            f"Produce only the {target_name} translation, without any additional explanations or commentary. "
+            f"Please translate the following {source_name} text into {target_name}:\n\n\n"
+            f"{input_text.strip()}"
+        )
     else:
-        return f"Translate the following text to {target_name}:\n\n{input_text}\n\nTranslation:"
+        return (
+            f"Produce only the {target_name} translation, without any additional explanations or commentary. "
+            f"Please translate the following text into {target_name}:\n\n\n"
+            f"{input_text.strip()}"
+        )
 
 
 def _has_chat_template(tokenizer) -> bool:

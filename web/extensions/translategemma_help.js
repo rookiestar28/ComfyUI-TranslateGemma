@@ -144,6 +144,21 @@ app.registerExtension({
 	async beforeRegisterNodeDef(nodeType, nodeData, app) {
 		if (nodeData?.name !== "TranslateGemma") return;
 
+		// Pad computed width slightly so the title-bar '?' doesn't overlap title text.
+		const originalComputeSize = nodeType.prototype.computeSize;
+		if (originalComputeSize) {
+			nodeType.prototype.computeSize = function () {
+				const size = originalComputeSize.apply(this, arguments);
+				try {
+					const titleH = (globalThis.LiteGraph?.NODE_TITLE_HEIGHT ?? 30);
+					if (this?.title) {
+						size[0] = Math.max(size[0], 120 + titleH * 2);
+					}
+				} catch {}
+				return size;
+			};
+		}
+
 		const onDrawForeground = nodeType.prototype.onDrawForeground;
 		const onMouseDown = nodeType.prototype.onMouseDown;
 
@@ -155,30 +170,37 @@ app.registerExtension({
 				this.__tgLabelsApplied = true;
 			}
 
-			const size = 14;
-			const margin = 6;
-			const x = this.size[0] - size - margin;
-			const y = margin;
-			this.__tgHelpRect = [x, y, size, size];
+			if (this?.flags?.collapsed) return;
 
+			// Draw '?' in the title bar (negative y in LiteGraph coords).
+			// Note: TranslateGemma shows an output slot on the title row, so we
+			// offset the icon left by one title-height to avoid overlapping the
+			// output connector/label and keep it clickable.
+			const titleH = globalThis.LiteGraph?.NODE_TITLE_HEIGHT ?? 30;
+			const helpX = this.size[0] - 17 - titleH;
 			ctx.save();
-			ctx.fillStyle = "rgba(0,0,0,0.35)";
-			ctx.beginPath();
-			ctx.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
-			ctx.fill();
+			ctx.font = "bold 20px Arial";
 			ctx.fillStyle = "#fff";
-			ctx.font = "bold 12px sans-serif";
-			ctx.textAlign = "center";
-			ctx.textBaseline = "middle";
-			ctx.fillText("?", x + size / 2, y + size / 2 + 0.5);
+			ctx.fillText("?", helpX, -8);
 			ctx.restore();
 		};
 
 		nodeType.prototype.onMouseDown = function (e, pos, canvas) {
-			const r = this.__tgHelpRect;
-			if (r) {
-				const [x, y, w, h] = r;
-				if (pos[0] >= x && pos[0] <= x + w && pos[1] >= y && pos[1] <= y + h) {
+			if (!this?.flags?.collapsed) {
+				// Title-bar click region (VideoHelperSuite-inspired) but uses a
+				// tighter hitbox so it doesn't conflict with the output slot.
+				const titleH = globalThis.LiteGraph?.NODE_TITLE_HEIGHT ?? 30;
+				const helpX = this.size[0] - 17 - titleH;
+				const hitLeft = helpX - 14;
+				const hitRight = helpX + 14;
+				const hitTop = -titleH;
+				const hitBottom = 0;
+				if (
+					pos?.[0] >= hitLeft &&
+					pos?.[0] <= hitRight &&
+					pos?.[1] >= hitTop &&
+					pos?.[1] <= hitBottom
+				) {
 					showHelpModal(nodeData);
 					return true;
 				}
