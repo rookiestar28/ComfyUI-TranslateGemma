@@ -144,6 +144,35 @@ TOKEN_COUNT_UNLIMITED: int = 10**9
 
 
 # =============================================================================
+# Long Text Strategy Constants (TG-050)
+# =============================================================================
+
+# Minimum input tokens before auto-continue strategy triggers.
+# Avoids wasting extra calls on short inputs.
+AUTO_CONTINUE_MIN_INPUT_TOKENS: int = 512
+
+# Maximum continuation rounds for auto-continue strategy.
+# Bounds total model calls: 1 (initial) + AUTO_CONTINUE_MAX_ROUNDS.
+AUTO_CONTINUE_MAX_ROUNDS: int = 2
+
+# Character window to check for overlap trimming in auto-continue.
+# Uses tail of accumulated output to find overlap with continuation prefix.
+AUTO_CONTINUE_OVERLAP_WINDOW: int = 600
+
+# Minimum overlap length to trigger trimming.
+# Prevents spurious short matches.
+AUTO_CONTINUE_OVERLAP_MIN_LENGTH: int = 40
+
+# Overlap ratio threshold for detecting duplicate continuation.
+# If continuation overlaps > 80% with previous output, stop.
+AUTO_CONTINUE_DUPLICATE_THRESHOLD: float = 0.8
+
+# Maximum characters of translation-so-far to include in continuation prompt.
+# Using only the tail prevents context explosion on long accumulated outputs.
+AUTO_CONTINUE_TRANSLATION_TAIL_CHARS: int = 1000
+
+
+# =============================================================================
 # Environment Variable Helpers
 # =============================================================================
 

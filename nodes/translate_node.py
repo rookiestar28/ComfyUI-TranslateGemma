@@ -39,6 +39,12 @@ from ..utils.runtime_constants import (
     STRUCTURED_TRUNCATION_MAX_ITERATIONS,
     STRUCTURED_TRUNCATION_ITERATION_BUFFER,
     TOKEN_COUNT_UNLIMITED,
+    AUTO_CONTINUE_MIN_INPUT_TOKENS,
+    AUTO_CONTINUE_MAX_ROUNDS,
+    AUTO_CONTINUE_OVERLAP_WINDOW,
+    AUTO_CONTINUE_OVERLAP_MIN_LENGTH,
+    AUTO_CONTINUE_DUPLICATE_THRESHOLD,
+    AUTO_CONTINUE_TRANSLATION_TAIL_CHARS,
     get_generation_heuristic_cap,
     get_repeat_guard_params,
 )
@@ -362,6 +368,16 @@ class TranslateGemmaNode:
                     "default": "auto_flip",
                     "tooltip": "auto_flip: detect input variant and convert to opposite. to_traditional: force Simplified→Traditional. to_simplified: force Traditional→Simplified. Returns error if input is ambiguous with auto_flip.",
                 }),
+                "long_text_strategy": (["disable", "auto-continue", "segmented"], {
+                    "default": "disable",
+                    "tooltip": (
+                        "disable: default single-call behavior.\n"
+                        "auto-continue: if the model stops early (<end_of_turn>) on long input, retry up to 2 rounds "
+                        "to continue the translation and merge outputs (best-effort; slower).\n"
+                        "segmented: split by blank lines and translate paragraph-by-paragraph, preserving paragraph "
+                        "separators (most robust for very long documents; slowest)."
+                    ),
+                }),
             },
         }
 
@@ -398,6 +414,7 @@ class TranslateGemmaNode:
         debug: Any = False,
         chinese_conversion_only: Any = False,
         chinese_conversion_direction: Any = "auto_flip",
+        long_text_strategy: Any = "disable",
     ) -> tuple[list[str]]:
         batch = self._list_max_len(
             text,
@@ -418,6 +435,7 @@ class TranslateGemmaNode:
             debug,
             chinese_conversion_only,
             chinese_conversion_direction,
+            long_text_strategy,
         )
         batch = max(int(batch), 1)
 
@@ -482,6 +500,14 @@ class TranslateGemmaNode:
                 "auto_flip" if raw_chinese_conversion_direction is None else str(raw_chinese_conversion_direction)
             )
 
+            raw_long_text_strategy = self._slice_or_default(long_text_strategy, i, "disable")
+            one_long_text_strategy = (
+                "disable" if raw_long_text_strategy is None else str(raw_long_text_strategy)
+            )
+            # TG-050: Normalize for workflow compatibility (accept both hyphen and underscore)
+            if one_long_text_strategy == "auto_continue":
+                one_long_text_strategy = "auto-continue"
+
             translated_text = self._translate_one(
                 text=one_text,
                 target_language=one_target_language,
@@ -501,6 +527,7 @@ class TranslateGemmaNode:
                 debug=one_debug,
                 chinese_conversion_only=one_chinese_conversion_only,
                 chinese_conversion_direction=one_chinese_conversion_direction,
+                long_text_strategy=one_long_text_strategy,
             )[0]
             results.append(translated_text)
 
@@ -526,12 +553,13 @@ class TranslateGemmaNode:
         debug: bool = False,
         chinese_conversion_only: bool = False,
         chinese_conversion_direction: str = "auto_flip",
+        long_text_strategy: str = "disable",
         _retry_plain_on_empty: bool = True,
         _eot_relaxed_retry: bool = False,
     ) -> tuple[str]:
         """
         Translate text to target language using TranslateGemma.
-        
+
         Args:
             text: Text from the built-in input field
             target_language: Target language name
@@ -550,6 +578,7 @@ class TranslateGemmaNode:
             debug: Enable debug logging
             chinese_conversion_only: Use OpenCC for Chinese conversion only (TG-038)
             chinese_conversion_direction: Conversion direction for TG-038 (auto_flip/to_traditional/to_simplified)
+            long_text_strategy: Long text handling (TG-050): disable/auto-continue/segmented
 
         Returns:
             Tuple containing translated text
@@ -583,10 +612,26 @@ class TranslateGemmaNode:
 
         # TG-009: Use external text if connected (is not None), otherwise use built-in text
         input_text = external_text if external_text is not None else text
-        
+
         if not input_text or not input_text.strip():
             return ("",)
-        
+
+        # TG-050: Segmented mode handles paragraphs separately (before main translation)
+        if long_text_strategy == "segmented":
+            return (self._segmented_translate(
+                input_text=input_text,
+                target_language=target_language,
+                source_language=source_language,
+                model_size=model_size,
+                prompt_mode=prompt_mode,
+                max_new_tokens=max_new_tokens,
+                max_input_tokens=max_input_tokens,
+                truncate_input=truncate_input,
+                strict_context_limit=strict_context_limit,
+                keep_model_loaded=keep_model_loaded,
+                debug=debug,
+            ),)
+
         target_code = get_language_code(target_language)
         # TranslateGemma's official chat template requires an explicit source_lang_code
         # (the model card does not define "auto"). For Auto Detect, do local detection.
@@ -712,6 +757,7 @@ class TranslateGemmaNode:
                         max_tokens=TOKEN_COUNT_UNLIMITED,
                     )
                     raw_input_len = overhead_len + int(raw_text_tokens)
+                    structured_truncation_needed = truncate_input and int(raw_input_len) > int(max_input_tokens)
 
                     if truncate_input and int(max_input_tokens) <= overhead_len:
                         raise RuntimeError(
@@ -721,7 +767,7 @@ class TranslateGemmaNode:
                         )
 
                     truncated_text = input_text
-                    if truncate_input and raw_input_len > int(max_input_tokens) and available_for_text > 0:
+                    if structured_truncation_needed and available_for_text > 0:
                         truncated_text, _, _ = truncate_text_tokens_to_fit(
                             tokenizer=tokenizer,
                             text=input_text,
@@ -752,12 +798,18 @@ class TranslateGemmaNode:
                             text=input_text,
                             max_tokens=available_for_text,
                         )
+
+                    # TG-051: If we didn't need to truncate, treat the structured raw token estimate as
+                    # authoritative based on the actual templated inputs. This prevents false-positive
+                    # truncation warnings caused by minor counting differences (e.g. raw=190 vs actual=189).
+                    if not structured_truncation_needed and actual_input_len is not None:
+                        raw_input_len = int(actual_input_len)
                 used_path = "processor.apply_chat_template(structured)"
 
                 # TG-034: Validate structured generation prompt wrapper
                 # Only run guard when truncation occurred (raw > actual)
                 guard_outcome = None
-                if truncate_input and raw_input_len and actual_input_len and raw_input_len > actual_input_len:
+                if truncate_input and raw_input_len and actual_input_len and int(raw_input_len) > int(actual_input_len):
                     input_ids = inputs["input_ids"] if inputs else None
                     wrapper_ok = check_structured_generation_prompt(tokenizer, input_ids) if input_ids is not None else False
                     if not wrapper_ok:
@@ -1117,6 +1169,36 @@ class TranslateGemmaNode:
                 return (
                     "[Error: Model returned empty output. "
                     "Try increasing max_new_tokens or switching prompt_mode.]",
+                )
+
+            # TG-050: Auto-continue strategy for long inputs that stopped early
+            if (
+                long_text_strategy == "auto-continue"
+                and gen_meta.stop_reason == StopReason.END_OF_TURN
+                and translated_text
+                and actual_input_len >= AUTO_CONTINUE_MIN_INPUT_TOKENS
+                and not (truncate_input and raw_input_len and actual_input_len and int(raw_input_len) > int(actual_input_len))
+            ):
+                if debug:
+                    print(
+                        f"[TranslateGemma] Auto-continue triggered: "
+                        f"stop_reason={gen_meta.stop_reason.value}, "
+                        f"input_tokens={actual_input_len}, output_chars={len(translated_text)}"
+                    )
+                translated_text = self._auto_continue_translate(
+                    initial_output=translated_text,
+                    input_text=input_text,
+                    target_language=target_language,
+                    source_language=source_language,
+                    model_size=model_size,
+                    prompt_mode=prompt_mode,
+                    max_new_tokens=max_new_tokens,
+                    max_input_tokens=max_input_tokens,
+                    truncate_input=truncate_input,
+                    strict_context_limit=strict_context_limit,
+                    keep_model_loaded=keep_model_loaded,
+                    debug=debug,
+                    actual_input_tokens=actual_input_len,
                 )
 
             return (translated_text,)
@@ -1636,6 +1718,274 @@ class TranslateGemmaNode:
             return (f"[Error: {e}]",)
         except Exception as e:
             return (f"[Error: Chinese conversion failed: {e}]",)
+
+    # =========================================================================
+    # TG-050: Long Text Strategy Helpers
+    # =========================================================================
+
+    @staticmethod
+    def _find_overlap_length(tail: str, head: str, min_length: int = 40) -> int:
+        """
+        Find the longest suffix of `tail` that matches a prefix of `head`.
+
+        Returns the length of the overlap, or 0 if no significant overlap found.
+        Used for overlap trimming in auto-continue mode.
+        """
+        if not tail or not head:
+            return 0
+
+        # Normalize whitespace for comparison
+        tail_norm = " ".join(tail.split())
+        head_norm = " ".join(head.split())
+
+        max_check = min(len(tail_norm), len(head_norm), AUTO_CONTINUE_OVERLAP_WINDOW)
+        best_overlap = 0
+
+        for length in range(min_length, max_check + 1):
+            suffix = tail_norm[-length:]
+            prefix = head_norm[:length]
+            if suffix.lower() == prefix.lower():
+                best_overlap = length
+
+        return best_overlap
+
+    @staticmethod
+    def _trim_overlap(accumulated: str, continuation: str, debug: bool = False) -> str:
+        """
+        Trim overlapping prefix from continuation based on accumulated output.
+
+        If the tail of `accumulated` overlaps with the prefix of `continuation`,
+        remove that prefix from `continuation` to avoid duplicated text.
+        """
+        if not accumulated or not continuation:
+            return continuation
+
+        # Use the tail of accumulated for overlap detection
+        tail_window = accumulated[-AUTO_CONTINUE_OVERLAP_WINDOW:] if len(accumulated) > AUTO_CONTINUE_OVERLAP_WINDOW else accumulated
+
+        overlap_len = TranslateGemmaNode._find_overlap_length(
+            tail_window, continuation, min_length=AUTO_CONTINUE_OVERLAP_MIN_LENGTH
+        )
+
+        if overlap_len > 0:
+            # Find the actual position in unnormalized continuation to trim
+            # Since we normalized whitespace, we need to find approximately where to cut
+            head_norm = " ".join(continuation.split())
+            if len(head_norm) >= overlap_len:
+                # Count characters in original string until we've passed overlap_len normalized chars
+                char_count = 0
+                orig_pos = 0
+                for i, ch in enumerate(continuation):
+                    if not ch.isspace() or (i > 0 and not continuation[i-1].isspace()):
+                        char_count += 1
+                    if char_count >= overlap_len:
+                        orig_pos = i + 1
+                        break
+                trimmed = continuation[orig_pos:].lstrip()
+                if debug:
+                    print(f"[TranslateGemma] Auto-continue overlap trimmed: {overlap_len} chars")
+                return trimmed
+
+        return continuation
+
+    def _auto_continue_translate(
+        self,
+        initial_output: str,
+        input_text: str,
+        target_language: str,
+        source_language: str,
+        model_size: str,
+        prompt_mode: str,
+        max_new_tokens: int,
+        max_input_tokens: int,
+        truncate_input: bool,
+        strict_context_limit: bool,
+        keep_model_loaded: bool,
+        debug: bool,
+        actual_input_tokens: int,
+    ) -> str:
+        """
+        TG-050: Auto-continue strategy for long text translation.
+
+        When the model stops early (end_of_turn) on long input, attempts to
+        continue the translation by prompting with the source + partial output.
+        """
+        import re
+
+        accumulated = initial_output
+        source_code = get_language_code(source_language) if source_language != "Auto Detect" else detect_source_lang_code(input_text)
+        target_code = get_language_code(target_language)
+
+        for round_num in range(1, AUTO_CONTINUE_MAX_ROUNDS + 1):
+            if debug:
+                print(f"[TranslateGemma] Long text strategy: auto-continue (round {round_num}/{AUTO_CONTINUE_MAX_ROUNDS})")
+
+            # Build continuation prompt
+            # Use only tail of source and accumulated to prevent context explosion
+            source_tail = input_text
+            if len(input_text) > 2000:
+                source_tail = "..." + input_text[-1500:]
+
+            # Use only the tail of accumulated translation to avoid context overflow
+            translation_tail = accumulated
+            if len(accumulated) > AUTO_CONTINUE_TRANSLATION_TAIL_CHARS:
+                translation_tail = "..." + accumulated[-AUTO_CONTINUE_TRANSLATION_TAIL_CHARS:]
+
+            continuation_instruction = (
+                f"Your previous translation was incomplete. Continue translating the remaining part. "
+                f"Do NOT repeat already translated text. Output only the continuation in {target_language}. "
+                f"No explanations.\n\n"
+                f"Source text:\n{source_tail}\n\n"
+                f"Translation so far:\n{translation_tail}\n\n"
+                f"Continue translation:"
+            )
+
+            # Use the existing translation path with plain mode for continuation
+            try:
+                result = self._translate_one(
+                    text=continuation_instruction,
+                    target_language=target_language,
+                    model_size=model_size,
+                    source_language=source_language,
+                    prompt_mode="plain",  # Use plain for continuation prompts
+                    max_new_tokens=max_new_tokens,
+                    max_input_tokens=max_input_tokens,
+                    truncate_input=truncate_input,
+                    strict_context_limit=strict_context_limit,
+                    keep_model_loaded=keep_model_loaded,
+                    debug=debug,
+                    long_text_strategy="disable",  # Prevent recursion
+                    _retry_plain_on_empty=False,
+                )
+                continuation = result[0] if result else ""
+            except Exception as e:
+                if debug:
+                    print(f"[TranslateGemma] Auto-continue round {round_num} failed: {e}")
+                break
+
+            # Check for empty output
+            if not continuation or not continuation.strip():
+                if debug:
+                    print(f"[TranslateGemma] Auto-continue round {round_num}: empty continuation, stopping")
+                break
+
+            # Check for error messages
+            if continuation.startswith("[Error:"):
+                if debug:
+                    print(f"[TranslateGemma] Auto-continue round {round_num}: error in continuation, stopping")
+                break
+
+            # Check for high overlap (duplicate detection)
+            # Use suffix-prefix overlap detection which works better for CJK
+            continuation_stripped = continuation.strip()
+            if len(continuation_stripped) > 0 and len(accumulated) > 0:
+                # Use tail window for overlap detection
+                tail_window = accumulated[-AUTO_CONTINUE_OVERLAP_WINDOW:] if len(accumulated) > AUTO_CONTINUE_OVERLAP_WINDOW else accumulated
+                overlap_len = self._find_overlap_length(
+                    tail_window, continuation_stripped, min_length=20  # Lower threshold for duplicate detection
+                )
+                overlap_ratio = overlap_len / len(continuation_stripped) if len(continuation_stripped) > 0 else 0.0
+
+                if overlap_ratio > AUTO_CONTINUE_DUPLICATE_THRESHOLD:
+                    if debug:
+                        print(
+                            f"[TranslateGemma] Auto-continue round {round_num}: "
+                            f"high overlap ({overlap_ratio:.1%}, {overlap_len} chars), stopping"
+                        )
+                    break
+
+            # Trim overlap and append
+            trimmed_continuation = self._trim_overlap(accumulated, continuation_stripped, debug=debug)
+            if trimmed_continuation:
+                # Join with space if accumulated doesn't end with punctuation/space
+                if accumulated and not accumulated[-1].isspace() and not accumulated[-1] in "。！？.!?,;:":
+                    accumulated = accumulated + " " + trimmed_continuation
+                else:
+                    accumulated = accumulated + trimmed_continuation
+
+            if debug:
+                print(
+                    f"[TranslateGemma] Auto-continue round {round_num}: "
+                    f"added {len(trimmed_continuation)} chars, total={len(accumulated)}"
+                )
+
+        return accumulated
+
+    def _segmented_translate(
+        self,
+        input_text: str,
+        target_language: str,
+        source_language: str,
+        model_size: str,
+        prompt_mode: str,
+        max_new_tokens: int,
+        max_input_tokens: int,
+        truncate_input: bool,
+        strict_context_limit: bool,
+        keep_model_loaded: bool,
+        debug: bool,
+    ) -> str:
+        """
+        TG-050: Segmented strategy for long text translation.
+
+        Splits input by paragraph (blank lines), translates each segment,
+        and reassembles with original separators preserved.
+        """
+        import re
+
+        # Split by blank lines while preserving the separators
+        # Pattern captures: text OR blank-line separator
+        parts = re.split(r"(\r?\n\s*\n)", input_text)
+
+        if debug:
+            non_empty_parts = [p for p in parts if p.strip()]
+            print(f"[TranslateGemma] Long text strategy: segmented ({len(non_empty_parts)} paragraphs)")
+
+        translated_parts = []
+        segment_index = 0
+
+        for part in parts:
+            # Check if this is a separator (blank lines)
+            if not part.strip():
+                # Preserve separator as-is
+                translated_parts.append(part)
+                continue
+
+            segment_index += 1
+            if debug:
+                print(f"[TranslateGemma] Segmented: translating segment {segment_index}")
+
+            try:
+                result = self._translate_one(
+                    text=part,
+                    target_language=target_language,
+                    model_size=model_size,
+                    source_language=source_language,
+                    prompt_mode=prompt_mode,
+                    max_new_tokens=max_new_tokens,
+                    max_input_tokens=max_input_tokens,
+                    truncate_input=truncate_input,
+                    strict_context_limit=strict_context_limit,
+                    keep_model_loaded=keep_model_loaded,
+                    debug=debug,
+                    long_text_strategy="disable",  # Prevent recursion
+                    _retry_plain_on_empty=True,
+                )
+                translated = result[0] if result else part
+            except Exception as e:
+                if debug:
+                    print(f"[TranslateGemma] Segmented segment {segment_index} failed: {e}")
+                translated = f"[Error translating segment: {e}]"
+
+            # Check for error in translation
+            if translated.startswith("[Error:"):
+                if debug:
+                    print(f"[TranslateGemma] Segmented segment {segment_index}: error, keeping original")
+                translated_parts.append(part)
+            else:
+                translated_parts.append(translated)
+
+        return "".join(translated_parts)
 
     @staticmethod
     def _comfy_image_to_pil(image: Any):

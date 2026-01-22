@@ -1,21 +1,46 @@
 # ComfyUI-TranslateGemma
 
+A ComfyUI integration for TranslateGemma — Google's new open source translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
+
 <p align="center">
   <img src="assets/TranslateGemma.png" alt="TranslateGemma" />
 </p>
-
-A ComfyUI integration for TranslateGemma — Google's new open source translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
 
  [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 
  ---
 
 **01/2026 update**:
-Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
 
-新增 `chinese_conversion_only` 和 `chinese_conversion_direction`，以便通過 OpenCC 快速進行簡體與繁體的轉換（無需模型載入）。
+- Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
+- Added `max_new_tokens=0` / `max_input_tokens=0` as **Auto** token budgeting (context-aware).
+- Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
+- Added a node UI `?` help modal and `0 = auto` labels for max token widgets.
 
 ---
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Hugging Face Access (Gated Models)](#hugging-face-access-gated-models)
+- [Model Storage Location](#model-storage-location)
+- [Node: TranslateGemma](#node-translategemma)
+  - [Inputs](#inputs)
+  - [Outputs](#outputs)
+- [Usage Notes](#usage-notes)
+  - [Text: Auto Detect](#text-auto-detect)
+  - [Image Translation Requires Source Language](#image-translation-requires-source-language)
+  - [Image Preprocessing (896×896)](#image-preprocessing-896896)
+  - [Notes on Chinese Variants](#notes-on-chinese-variants)
+  - [Chinese Conversion-Only Mode (TG-038)](#chinese-conversion-only-mode-tg-038)
+  - [Long Text Strategy (TG-050)](#long-text-strategy-tg-050)
+  - [Language Code Normalization](#language-code-normalization)
+- [Default Settings (TG-032)](#default-settings-tg-032)
+- [Performance Tips](#performance-tips)
+- [VRAM Notes (Native Models)](#vram-notes-native-models)
+- [Security / Reproducibility Notes](#security--reproducibility-notes)
+- [License](#license)
 
 ## Features
 
@@ -112,6 +137,7 @@ Category: `text/translation`
 | `debug` | BOOLEAN | Enable debug logging. Sensitive data redacted by default; set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` for full details. Default: `false`. |
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
+| `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
 
 ### Outputs
 
@@ -212,6 +238,47 @@ For workflows that only need **script conversion** (Simplified ↔ Traditional) 
 - You want to avoid model download/load overhead
 - You need deterministic, reproducible output (no LLM randomness)
 
+### Long Text Strategy (TG-050)
+
+For long texts, the model may stop early (emitting `<end_of_turn>`) before completing the translation. The `long_text_strategy` option provides two approaches:
+
+**`disable`** (default): Standard single-call behavior. Suitable for most inputs.
+
+**`auto-continue`** (also accepts `auto_continue`): Best-effort continuation when the model stops early on long input.
+
+- Only triggers when: input is long (≥512 tokens), model stopped via `<end_of_turn>`, and input was not truncated.
+- Prompts the model to continue the translation (up to 2 additional rounds).
+- Uses overlap trimming to avoid duplicated text at continuation boundaries.
+- Trade-off: may increase latency (2–3× model calls), but improves completeness for long texts.
+
+**`segmented`**: Translate paragraph-by-paragraph.
+
+- Splits input by blank lines (preserves original separators).
+- Translates each paragraph in a separate model call.
+- Reassembles with original blank lines preserved.
+- Trade-off: slower (N model calls for N paragraphs), but handles very long documents and preserves paragraph structure.
+
+**When to use:**
+
+| Scenario                                 | Recommended     |
+|------------------------------------------|-----------------|
+| Short/medium text (<2000 chars)          | `disable`       |
+| Long text that sometimes truncates early | `auto-continue` |
+| Very long document with many paragraphs  | `segmented`     |
+| Speed is critical                        | `disable`       |
+
+**Recommended settings for long documents:**
+
+- Set `max_input_tokens=0` and `max_new_tokens=0` (Auto) so the node stays context-aware.
+- If you see early stops with incomplete output: try `long_text_strategy=auto-continue`.
+- For very long documents or many paragraphs: try `long_text_strategy=segmented` (more robust, but slower).
+
+**Limitations:**
+
+- Text-only for v1 (image path not affected).
+- `segmented` mode has higher latency for many-paragraph documents.
+- `auto-continue` continuation quality depends on model; may occasionally repeat or diverge.
+
 ### Language Code Normalization
 
 The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` and `zh-Hant`). Internally, codes are normalized to match the official TranslateGemma template format.
@@ -235,6 +302,7 @@ The following are the authoritative default values for node inputs:
 | `image_two_pass` | `true` | Extract then translate |
 | `chinese_conversion_only` | `false` | OpenCC conversion without model |
 | `chinese_conversion_direction` | `auto_flip` | Auto-detect and flip variant |
+| `long_text_strategy` | `disable` | Single-call (no continuation) |
 
 ## Performance Tips
 
