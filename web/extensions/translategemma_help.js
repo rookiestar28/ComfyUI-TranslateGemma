@@ -45,10 +45,12 @@ function buildHelpHtml(nodeData) {
 		const keys = Object.keys(section.data || {});
 		if (!keys.length) continue;
 		rows.push(`<h3 style="margin:12px 0 6px;">${escapeHtml(section.title)}</h3>`);
-		rows.push(`<table style="width:100%; border-collapse:collapse; font-size:12px;">`);
+		// Use fixed table layout + aggressive wrapping to avoid ComfyUI global styles (e.g. code { white-space: pre })
+		// causing long tooltips to overflow and get visually truncated.
+		rows.push(`<table style="width:100%; border-collapse:collapse; font-size:14px; table-layout:fixed;">`);
 		rows.push(
 			`<tr>
-				<th style="text-align:left; padding:6px; border-bottom:1px solid #333;">Param</th>
+				<th style="width:220px; text-align:left; padding:6px; border-bottom:1px solid #333;">Param</th>
 				<th style="text-align:left; padding:6px; border-bottom:1px solid #333;">Details</th>
 			</tr>`
 		);
@@ -73,16 +75,18 @@ function buildHelpHtml(nodeData) {
 			}
 
 			const details = [
-				`<div style="color:#bdbdbd; margin-bottom:4px;"><code>${escapeHtml(type)}</code>${extra.length ? ` — <span>${extra.join(", ")}</span>` : ""}</div>`,
-				tooltip ? `<div style="white-space:pre-wrap; line-height:1.35;">${escapeHtml(tooltip)}</div>` : "",
+				`<div style="color:#bdbdbd; margin-bottom:4px; overflow-wrap:anywhere; word-break:break-word;"><code style="white-space:normal; overflow-wrap:anywhere; word-break:break-word;">${escapeHtml(type)}</code>${extra.length ? ` — <span style="overflow-wrap:anywhere; word-break:break-word;">${extra.join(", ")}</span>` : ""}</div>`,
+				tooltip
+					? `<div style="white-space:pre-wrap; line-height:1.35; overflow-wrap:anywhere; word-break:break-word;">${escapeHtml(tooltip)}</div>`
+					: "",
 			].join("");
 
 			rows.push(
 				`<tr>
-					<td style="vertical-align:top; padding:6px; border-bottom:1px solid #222;"><code>${escapeHtml(
+					<td style="vertical-align:top; padding:6px; border-bottom:1px solid #222; overflow-wrap:anywhere; word-break:break-word;"><code style="white-space:normal; overflow-wrap:anywhere; word-break:break-word;">${escapeHtml(
 						key
 					)}</code></td>
-					<td style="vertical-align:top; padding:6px; border-bottom:1px solid #222;">${details}</td>
+					<td style="vertical-align:top; padding:6px; border-bottom:1px solid #222; overflow-wrap:anywhere; word-break:break-word;">${details}</td>
 				</tr>`
 			);
 		}
@@ -91,13 +95,13 @@ function buildHelpHtml(nodeData) {
 
 	return `
 		<div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
-			<div style="font-size:14px; font-weight:600;">TranslateGemma — Parameter Reference</div>
+			<div style="font-size:16px; font-weight:600;">TranslateGemma — Parameter Reference</div>
 			<button id="tg-help-close" style="background:#2a2a2a; color:#fff; border:1px solid #444; border-radius:6px; padding:6px 10px; cursor:pointer;">Close</button>
 		</div>
-		<div style="margin-top:10px; color:#bdbdbd; font-size:12px;">
+		<div style="margin-top:10px; color:#bdbdbd; font-size:14px;">
 			Quick tips: <code>max_new_tokens=0</code> and <code>max_input_tokens=0</code> enable Auto sizing.
 		</div>
-		<div style="margin-top:10px; padding:10px; border:1px solid #222; border-radius:10px; background:#0d0d0d; color:#cfcfcf; font-size:12px; line-height:1.4;">
+		<div style="margin-top:10px; padding:10px; border:1px solid #222; border-radius:10px; background:#0d0d0d; color:#cfcfcf; font-size:14px; line-height:1.4; overflow-wrap:anywhere; word-break:break-word;">
 			<div style="font-weight:600; margin-bottom:6px;">Feature Notes</div>
 			<ul style="margin:0; padding-left:18px;">
 				${hasParam("quantization") ? `<li><code>quantization</code>: BitsAndBytes VRAM reduction (<code>bnb-8bit</code>/<code>bnb-4bit</code>) requires a CUDA GPU + <code>bitsandbytes</code>. Use <code>none</code> if unsupported.</li>` : ""}
