@@ -27,6 +27,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - [Installation](#installation)
 - [Hugging Face Access (Gated Models)](#hugging-face-access-gated-models)
 - [Model Storage Location](#model-storage-location)
+  - [Manual / Offline Download (Recommended for Restricted Networks)](#manual--offline-download-recommended-for-restricted-networks)
 - [Node: TranslateGemma](#node-translategemma)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
@@ -113,6 +114,41 @@ Models are stored under ComfyUI's models directory in a per-repo folder:
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-4b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-12b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-27b-it/`
+
+### Manual / Offline Download (Recommended for Restricted Networks)
+
+Yes — you can manually download the model files and place them into the folders above.
+This is useful if auto-download is slow/unreliable due to network restrictions (e.g. firewall/proxy, unstable DNS, or
+regions where `huggingface.co` is blocked).
+
+**What to do:**
+
+1) On a machine that can access Hugging Face, download the **entire** model repo snapshot (all files).
+2) Copy the downloaded folder into your ComfyUI models path, for example:
+
+```
+ComfyUI/
+  models/
+    LLM/
+      TranslateGemma/
+        translategemma-4b-it/
+          config.json
+          generation_config.json
+          model.safetensors.index.json
+          *.safetensors (or pytorch_model*.bin)
+          tokenizer_config.json
+          special_tokens_map.json
+          processor_config.json
+          preprocessor_config.json
+          chat_template.jinja (if present)
+          ... (other files from the repo)
+```
+
+3) Restart ComfyUI. The node will load from disk and skip downloading if the snapshot is complete.
+
+Notes:
+- Gated models still require accepting the Gemma/TranslateGemma terms on Hugging Face (do this on the download machine).
+- If you copy an incomplete folder, the node may attempt to resume/download missing files when network allows.
 
 ## Node: TranslateGemma
 
