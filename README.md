@@ -15,7 +15,9 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
 - Added `max_new_tokens=0` / `max_input_tokens=0` as **Auto** token budgeting (context-aware).
 - Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
+- Added optional BitsAndBytes quantization (`quantization`: `none` / `bnb-8bit` / `bnb-4bit`) for best-effort VRAM reduction.
 - Added a node UI `?` help modal and `0 = auto` labels for max token widgets.
+- Improved Hugging Face download diagnostics (network/auth/disk hints + retries) and added troubleshooting guidance (proxy/mirror/offline).
 
 ---
 
@@ -25,6 +27,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - [Installation](#installation)
 - [Hugging Face Access (Gated Models)](#hugging-face-access-gated-models)
 - [Model Storage Location](#model-storage-location)
+  - [Manual / Offline Download (Recommended for Restricted Networks)](#manual--offline-download-recommended-for-restricted-networks)
 - [Node: TranslateGemma](#node-translategemma)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
@@ -39,6 +42,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - [Default Settings (TG-032)](#default-settings-tg-032)
 - [Performance Tips](#performance-tips)
 - [VRAM Notes (Native Models)](#vram-notes-native-models)
+- [Quantization (bitsandbytes) — TG-014](#quantization-bitsandbytes--tg-014)
 - [Security / Reproducibility Notes](#security--reproducibility-notes)
 - [License](#license)
 
@@ -130,6 +134,41 @@ Models are stored under ComfyUI's models directory in a per-repo folder:
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-12b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-27b-it/`
 
+### Manual / Offline Download (Recommended for Restricted Networks)
+
+Yes — you can manually download the model files and place them into the folders above.
+This is useful if auto-download is slow/unreliable due to network restrictions (e.g. firewall/proxy, unstable DNS, or
+regions where `huggingface.co` is blocked).
+
+**What to do:**
+
+1) On a machine that can access Hugging Face, download the **entire** model repo snapshot (all files).
+2) Copy the downloaded folder into your ComfyUI models path, for example:
+
+```
+ComfyUI/
+  models/
+    LLM/
+      TranslateGemma/
+        translategemma-4b-it/
+          config.json
+          generation_config.json
+          model.safetensors.index.json
+          *.safetensors (or pytorch_model*.bin)
+          tokenizer_config.json
+          special_tokens_map.json
+          processor_config.json
+          preprocessor_config.json
+          chat_template.jinja (if present)
+          ... (other files from the repo)
+```
+
+3) Restart ComfyUI. The node will load from disk and skip downloading if the snapshot is complete.
+
+Notes:
+- Gated models still require accepting the Gemma/TranslateGemma terms on Hugging Face (do this on the download machine).
+- If you copy an incomplete folder, the node may attempt to resume/download missing files when network allows.
+
 ## Node: TranslateGemma
 
 Category: `text/translation`
@@ -157,6 +196,7 @@ Category: `text/translation`
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 | `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
+| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes (TG-014). `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). Requires CUDA + bitsandbytes installed. |
 
 ### Outputs
 
@@ -322,6 +362,7 @@ The following are the authoritative default values for node inputs:
 | `chinese_conversion_only` | `false` | OpenCC conversion without model |
 | `chinese_conversion_direction` | `auto_flip` | Auto-detect and flip variant |
 | `long_text_strategy` | `disable` | Single-call (no continuation) |
+| `quantization` | `none` | No quantization (full precision) |
 
 ## Performance Tips
 
@@ -335,6 +376,61 @@ The following are the authoritative default values for node inputs:
   - 4B model: ~12 GB
   - 12B model: ~27 GB
   - 27B model: ~56 GB
+
+## Quantization (bitsandbytes) — TG-014
+
+**Best-effort VRAM reduction** for running larger models (12B/27B) on consumer GPUs.
+
+### How It Works
+
+The `quantization` input allows you to load the model in lower precision using [bitsandbytes](https://github.com/TimDettmers/bitsandbytes):
+
+| Mode | VRAM Reduction | Quality | Notes |
+|------|----------------|---------|-------|
+| `none` (default) | — | Best | Full precision (BF16/FP16) |
+| `bnb-8bit` | ~50% | Good | 8-bit quantization |
+| `bnb-4bit` | ~75% | Acceptable | 4-bit NF4 quantization |
+
+### Requirements
+
+- **CUDA GPU**: bitsandbytes quantization only works on NVIDIA GPUs with CUDA
+- **bitsandbytes installed**: `pip install bitsandbytes`
+- **transformers with BitsAndBytesConfig**: `pip install --upgrade transformers`
+
+### Troubleshooting
+
+"bitsandbytes quantization requires a CUDA GPU":
+
+- You're running on CPU or MPS (Apple Silicon)
+- Set `quantization=none` or use a CUDA-capable GPU
+
+"bitsandbytes not installed":
+
+- Install: `pip install bitsandbytes`
+- Windows users: see [bitsandbytes-windows-webui](https://github.com/jllllll/bitsandbytes-windows-webui) for prebuilt wheels (third-party, evaluate risk yourself)
+- ComfyUI Desktop users: quantization may require manual bitsandbytes installation; if install fails, use `quantization=none` or run the 4B model
+
+"BitsAndBytesConfig not found":
+
+- Upgrade transformers: `pip install --upgrade transformers`
+
+"CUDA Setup failed" or "libbitsandbytes_cudaXXX not found" (import succeeds but loading fails):
+
+- This means bitsandbytes was built for a different CUDA version or your GPU's compute capability is unsupported
+- Set `quantization=none` as a workaround
+- Include the full error message when reporting issues
+
+### Environment Variables (Advanced)
+
+- `TRANSLATEGEMMA_BNB_4BIT_COMPUTE_DTYPE`: Force compute dtype for 4-bit (`bf16` or `fp16`). Default: auto-detect.
+- `TRANSLATEGEMMA_BNB_4BIT_DOUBLE_QUANT`: Enable double quantization (`1` = enabled, `0` = disabled). Default: `1`.
+
+### Limitations
+
+- Quantization is **best-effort**: TranslateGemma official docs do not explicitly promise bitsandbytes support
+- Translation quality may degrade slightly with quantization
+- Not supported on CPU or MPS (Apple Silicon) — only CUDA GPUs
+- Windows/Desktop users may encounter install issues with bitsandbytes
 
 ## Security / Reproducibility Notes
 

@@ -32,9 +32,12 @@ function applyWidgetLabelOverrides(node) {
 
 function buildHelpHtml(nodeData) {
 	const input = nodeData?.input || {};
+	const required = input.required || {};
+	const optional = input.optional || {};
+	const hasParam = (name) => Object.prototype.hasOwnProperty.call(required, name) || Object.prototype.hasOwnProperty.call(optional, name);
 	const sections = [
-		{ title: "Required Inputs", data: input.required || {} },
-		{ title: "Optional Inputs", data: input.optional || {} },
+		{ title: "Required Inputs", data: required },
+		{ title: "Optional Inputs", data: optional },
 	];
 
 	const rows = [];
@@ -93,6 +96,15 @@ function buildHelpHtml(nodeData) {
 		</div>
 		<div style="margin-top:10px; color:#bdbdbd; font-size:12px;">
 			Quick tips: <code>max_new_tokens=0</code> and <code>max_input_tokens=0</code> enable Auto sizing.
+		</div>
+		<div style="margin-top:10px; padding:10px; border:1px solid #222; border-radius:10px; background:#0d0d0d; color:#cfcfcf; font-size:12px; line-height:1.4;">
+			<div style="font-weight:600; margin-bottom:6px;">Feature Notes</div>
+			<ul style="margin:0; padding-left:18px;">
+				${hasParam("quantization") ? `<li><code>quantization</code>: BitsAndBytes VRAM reduction (<code>bnb-8bit</code>/<code>bnb-4bit</code>) requires a CUDA GPU + <code>bitsandbytes</code>. Use <code>none</code> if unsupported.</li>` : ""}
+				${hasParam("chinese_conversion_only") ? `<li><code>chinese_conversion_only</code>: OpenCC Simplified↔Traditional conversion without loading the model (text-only).</li>` : ""}
+				${hasParam("long_text_strategy") ? `<li><code>long_text_strategy</code>: Use <code>auto-continue</code> or <code>segmented</code> for long documents to reduce early-stop cases.</li>` : ""}
+				<li>If model downloads are slow/unreliable, you can manually copy the model snapshot into your ComfyUI models folder and restart (see README for exact folder structure).</li>
+			</ul>
 		</div>
 		${rows.join("")}
 	`;
