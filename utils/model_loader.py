@@ -357,13 +357,88 @@ def ensure_model_downloaded(
             "falling back to transformers implicit download"
         )
         return False
-    
-    print(f"[TranslateGemma] Downloading {repo_id} to {local_dir}...")
-    if revision:
-        print(f"[TranslateGemma] Using revision: {revision}")
-    
-    try:
-        # TG-027: Enable resume_download for interrupted downloads
+
+    def _classify_download_error(exc: Exception) -> tuple[str, str]:
+        """
+        Best-effort error classification with actionable hints.
+
+        Returns:
+            (kind, hint)
+            kind in {"auth", "network", "disk", "unknown"}
+        """
+        error_str = str(exc)
+        lower = error_str.lower()
+
+        # Auth / gated / forbidden
+        auth_keywords = [
+            "401",
+            "403",
+            "gated",
+            "forbidden",
+            "unauthorized",
+            "access denied",
+            "requires authentication",
+            "invalid token",
+            "token",
+        ]
+        if any(kw in lower for kw in auth_keywords):
+            return (
+                "auth",
+                "This model may be gated or require authentication. "
+                "Accept the license on Hugging Face and set `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`), then retry.",
+            )
+
+        # Disk / permissions
+        disk_keywords = [
+            "no space left on device",
+            "disk full",
+            "not enough space",
+            "permission denied",
+            "access is denied",
+            "read-only file system",
+            "readonly file system",
+        ]
+        if any(kw in lower for kw in disk_keywords):
+            return (
+                "disk",
+                "Check free disk space and write permissions for the model cache directory, then retry. "
+                "Tip: try deleting the incomplete folder and re-downloading.",
+            )
+
+        # Network / connectivity (common behind firewalls / blocked regions)
+        network_keywords = [
+            "timed out",
+            "timeout",
+            "connection error",
+            "connection aborted",
+            "connection reset",
+            "connection refused",
+            "max retries exceeded",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "dns",
+            "proxy",
+            "ssl",
+            "tls",
+            "certificate verify failed",
+            "remote end closed connection",
+        ]
+        if any(kw in lower for kw in network_keywords):
+            return (
+                "network",
+                "Network issue while contacting Hugging Face. This can happen behind a firewall, unstable network, "
+                "or in regions where `huggingface.co` is blocked (e.g. some China networks). "
+                "Options:\n"
+                "- Configure a proxy: set `HTTP_PROXY` / `HTTPS_PROXY`\n"
+                "- Use a mirror endpoint (community): set `HF_ENDPOINT` (or `HUGGINGFACE_HUB_ENDPOINT`) to a mirror URL\n"
+                "- Offline: download the model on another machine and copy files into the cache dir, then restart ComfyUI",
+            )
+
+        return ("unknown", "Retry later and check the full stack trace for details.")
+
+    def _download_attempt(attempt: int, max_attempts: int) -> None:
+        if max_attempts > 1:
+            print(f"[TranslateGemma] Download attempt {attempt}/{max_attempts}")
         snapshot_download(
             repo_id=repo_id,
             local_dir=local_dir,
@@ -371,6 +446,44 @@ def ensure_model_downloaded(
             revision=revision,
             resume_download=True,  # TG-027: Resume partial downloads
         )
+    
+    print(f"[TranslateGemma] Downloading {repo_id} to {local_dir}...")
+    if revision:
+        print(f"[TranslateGemma] Using revision: {revision}")
+    
+    # TG-052: Clearer download diagnostics + small retry loop
+    retries_env = os.environ.get("TRANSLATEGEMMA_DOWNLOAD_RETRIES", "").strip()
+    try:
+        max_attempts = max(1, int(retries_env)) if retries_env else 2
+    except Exception:
+        max_attempts = 2
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _download_attempt(attempt, max_attempts)
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            kind, hint = _classify_download_error(e)
+            if debug:
+                print(f"[TranslateGemma] Download error classified as: {kind}")
+            if attempt < max_attempts:
+                # Basic backoff (1s, 2s, 4s...)
+                backoff = 2 ** (attempt - 1)
+                print(f"[TranslateGemma] Download failed: {type(e).__name__}: {e}")
+                print(f"[TranslateGemma] Retrying in {backoff}s... ({hint})")
+                try:
+                    import time
+
+                    time.sleep(backoff)
+                except Exception:
+                    pass
+            else:
+                break
+
+    if last_exc is None:
         print(f"[TranslateGemma] Download complete: {local_dir}")
         
         # TG-027: Post-download verification
@@ -384,22 +497,43 @@ def ensure_model_downloaded(
             )
         
         return True
-    except Exception as e:
-        # Check for auth/gating errors
-        error_str = str(e).lower()
-        auth_keywords = ["401", "403", "gated", "forbidden", "unauthorized", "access denied"]
-        if any(kw in error_str for kw in auth_keywords):
-            raise RuntimeError(
-                f"Failed to download model '{repo_id}' - access denied.\n\n"
-                "To resolve:\n"
-                "1. Visit the model page on Hugging Face and accept the license terms\n"
-                "2. Authenticate with Hugging Face (one of):\n"
-                "   - Run: hf auth login\n"
-                "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
-                "3. Restart ComfyUI\n\n"
-                f"Original error: {e}"
-            ) from e
-        raise RuntimeError(f"Failed to download model '{repo_id}': {e}") from e
+
+    assert last_exc is not None
+    kind, hint = _classify_download_error(last_exc)
+
+    # Keep the legacy auth flow message (more explicit)
+    if kind == "auth":
+        raise RuntimeError(
+            f"Failed to download model '{repo_id}' - access denied.\n\n"
+            "To resolve:\n"
+            "1. Visit the model page on Hugging Face and accept the license terms\n"
+            "2. Authenticate with Hugging Face (one of):\n"
+            "   - Run: hf auth login\n"
+            "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
+            "3. Restart ComfyUI\n\n"
+            f"Original error: {last_exc}"
+        ) from last_exc
+
+    # Generic / network / disk
+    endpoint = os.environ.get("HF_ENDPOINT") or os.environ.get("HUGGINGFACE_HUB_ENDPOINT") or ""
+    proxy_http = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
+    proxy_https = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+
+    extra_lines = []
+    if endpoint:
+        extra_lines.append(f"- HF endpoint: {endpoint}")
+    if proxy_http or proxy_https:
+        extra_lines.append("- Proxy configured via HTTP(S)_PROXY")
+
+    extra_context = ("\n\n[Env]\n" + "\n".join(extra_lines)) if extra_lines else ""
+
+    raise RuntimeError(
+        f"Failed to download model '{repo_id}'.\n\n"
+        f"[Cause]\n{type(last_exc).__name__}: {last_exc}\n\n"
+        f"[Hint]\n{hint}\n\n"
+        f"[Cache dir]\n{local_dir}"
+        f"{extra_context}"
+    ) from last_exc
 
 
 def unload_current_model():

@@ -100,6 +100,25 @@ Alternatively, set one of these environment variables for the ComfyUI process:
 
 1) Restart ComfyUI after changing authentication.
 
+## Download Troubleshooting (Hugging Face)
+
+If the model download stalls at `Fetching ...` or fails with connection errors, it is usually not a node bug.
+Common causes: unstable network, corporate firewall/proxy, DNS issues, or regions where `huggingface.co` is blocked
+(some China networks).
+
+Things to try:
+
+- Retry: downloads are resumable; restarting ComfyUI often continues where it left off.
+- Proxy: set `HTTP_PROXY` / `HTTPS_PROXY` for the ComfyUI process.
+- Mirror endpoint (community): set `HF_ENDPOINT` (or `HUGGINGFACE_HUB_ENDPOINT`) to a mirror URL, then restart ComfyUI.
+- Offline/manual: download the model on a machine that can reach Hugging Face, then copy the downloaded folder into the
+  model cache directory (see **Model Storage Location** below) and restart ComfyUI.
+
+Notes:
+
+- Community mirrors are not official; availability and correctness are not guaranteed.
+- If you see `401/403/gated/forbidden`, you likely need to accept the license and/or set `HF_TOKEN`.
+
 ## Model Storage Location
 
 Models are stored under ComfyUI's models directory in a per-repo folder:
