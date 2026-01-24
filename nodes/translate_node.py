@@ -14,8 +14,9 @@ from ..utils.image_preprocess import (
 from ..utils.chinese_postedit import postedit_traditional_chinese
 from ..utils.chinese_convert import convert_chinese_variants, is_chinese_variant_code, infer_chinese_variant
 from ..utils.model_loader import (
-    load_model, get_available_models, unload_current_model, 
-    cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS
+    load_model, get_available_models, unload_current_model,
+    cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS,
+    QUANTIZATION_OPTIONS,  # TG-014
 )
 from ..utils.prompt_builder import (
     PromptMode,
@@ -378,6 +379,18 @@ class TranslateGemmaNode:
                         "separators (most robust for very long documents; slowest)."
                     ),
                 }),
+                # TG-014: BitsAndBytes quantization for VRAM reduction
+                "quantization": (list(QUANTIZATION_OPTIONS), {
+                    "default": "none",
+                    "tooltip": (
+                        "Best-effort VRAM reduction using bitsandbytes (TG-014).\n"
+                        "none: No quantization (default, full precision).\n"
+                        "bnb-8bit: 8-bit quantization (~50% VRAM reduction).\n"
+                        "bnb-4bit: 4-bit quantization (~75% VRAM reduction, NF4).\n"
+                        "Requires: CUDA GPU + bitsandbytes installed. "
+                        "Falls back to error with guidance if unavailable."
+                    ),
+                }),
             },
         }
 
@@ -415,6 +428,7 @@ class TranslateGemmaNode:
         chinese_conversion_only: Any = False,
         chinese_conversion_direction: Any = "auto_flip",
         long_text_strategy: Any = "disable",
+        quantization: Any = "none",  # TG-014
     ) -> tuple[list[str]]:
         batch = self._list_max_len(
             text,
@@ -436,6 +450,7 @@ class TranslateGemmaNode:
             chinese_conversion_only,
             chinese_conversion_direction,
             long_text_strategy,
+            quantization,  # TG-014
         )
         batch = max(int(batch), 1)
 
@@ -508,6 +523,10 @@ class TranslateGemmaNode:
             if one_long_text_strategy == "auto_continue":
                 one_long_text_strategy = "auto-continue"
 
+            # TG-014: Handle quantization parameter
+            raw_quantization = self._slice_or_default(quantization, i, "none")
+            one_quantization = "none" if raw_quantization is None else str(raw_quantization)
+
             translated_text = self._translate_one(
                 text=one_text,
                 target_language=one_target_language,
@@ -528,6 +547,7 @@ class TranslateGemmaNode:
                 chinese_conversion_only=one_chinese_conversion_only,
                 chinese_conversion_direction=one_chinese_conversion_direction,
                 long_text_strategy=one_long_text_strategy,
+                quantization=one_quantization,  # TG-014
             )[0]
             results.append(translated_text)
 
@@ -554,6 +574,7 @@ class TranslateGemmaNode:
         chinese_conversion_only: bool = False,
         chinese_conversion_direction: str = "auto_flip",
         long_text_strategy: str = "disable",
+        quantization: str = "none",  # TG-014
         _retry_plain_on_empty: bool = True,
         _eot_relaxed_retry: bool = False,
     ) -> tuple[str]:
@@ -579,6 +600,7 @@ class TranslateGemmaNode:
             chinese_conversion_only: Use OpenCC for Chinese conversion only (TG-038)
             chinese_conversion_direction: Conversion direction for TG-038 (auto_flip/to_traditional/to_simplified)
             long_text_strategy: Long text handling (TG-050): disable/auto-continue/segmented
+            quantization: Quantization mode (TG-014): none/bnb-8bit/bnb-4bit
 
         Returns:
             Tuple containing translated text
@@ -608,6 +630,7 @@ class TranslateGemmaNode:
                 strict_context_limit=strict_context_limit,
                 keep_model_loaded=keep_model_loaded,
                 debug=debug,
+                quantization=quantization,  # TG-014
             )
 
         # TG-009: Use external text if connected (is not None), otherwise use built-in text
@@ -630,6 +653,7 @@ class TranslateGemmaNode:
                 strict_context_limit=strict_context_limit,
                 keep_model_loaded=keep_model_loaded,
                 debug=debug,
+                quantization=quantization,  # TG-014
             ),)
 
         target_code = get_language_code(target_language)
@@ -656,8 +680,9 @@ class TranslateGemmaNode:
                 )
         
         # Load model and processor/tokenizer
+        # TG-014: Pass quantization to load_model
         t_load_start = time.time()
-        model, processor = load_model(model_size)
+        model, processor = load_model(model_size, quantization=quantization)
         t_load_s = time.time() - t_load_start
         tokenizer = getattr(processor, "tokenizer", processor)
 
@@ -1130,6 +1155,7 @@ class TranslateGemmaNode:
                             debug=debug,
                             chinese_conversion_only=chinese_conversion_only,
                             chinese_conversion_direction=chinese_conversion_direction,
+                            quantization=quantization,  # TG-014
                             _retry_plain_on_empty=True,
                             _eot_relaxed_retry=True,
                         )
@@ -1157,6 +1183,7 @@ class TranslateGemmaNode:
                         debug=debug,
                         chinese_conversion_only=chinese_conversion_only,
                         chinese_conversion_direction=chinese_conversion_direction,
+                        quantization=quantization,  # TG-014
                         _retry_plain_on_empty=False,
                         _eot_relaxed_retry=False,
                     )
@@ -1199,6 +1226,7 @@ class TranslateGemmaNode:
                     keep_model_loaded=keep_model_loaded,
                     debug=debug,
                     actual_input_tokens=actual_input_len,
+                    quantization=quantization,  # TG-014
                 )
 
             return (translated_text,)
@@ -1227,13 +1255,15 @@ class TranslateGemmaNode:
         strict_context_limit: bool,
         keep_model_loaded: bool,
         debug: bool,
+        quantization: str = "none",  # TG-014
     ) -> tuple[str]:
         """
         Translate text found in an image using TranslateGemma multimodal chat template.
 
         TG-025: Uses 896×896 preprocessing for optimal vision encoder grounding.
         TG-025: Optional two-pass mode: extract (source→source) then translate extracted text (source→target).
-        
+        TG-014: Supports quantization parameter for VRAM reduction.
+
         Ref: `REFERENCE/translategemma4b/README.md` ("Text Extraction and Translation")
         """
         # The official template requires an explicit source_lang_code; OCR-free auto-detect
@@ -1244,8 +1274,9 @@ class TranslateGemmaNode:
                 "Auto Detect is not supported by the official TranslateGemma chat template.]",
             )
 
+        # TG-014: Pass quantization to load_model
         t_load_start = time.time()
-        model, processor = load_model(model_size)
+        model, processor = load_model(model_size, quantization=quantization)
         t_load_s = time.time() - t_load_start
         tokenizer = getattr(processor, "tokenizer", processor)
 
@@ -1588,6 +1619,7 @@ class TranslateGemmaNode:
                     debug=debug,
                     chinese_conversion_only=False,
                     chinese_conversion_direction="auto_flip",
+                    quantization=quantization,  # TG-014
                 )
 
             # Single-pass output: enforce Traditional script when targeting zh_Hant.
@@ -1803,12 +1835,14 @@ class TranslateGemmaNode:
         keep_model_loaded: bool,
         debug: bool,
         actual_input_tokens: int,
+        quantization: str = "none",  # TG-014
     ) -> str:
         """
         TG-050: Auto-continue strategy for long text translation.
 
         When the model stops early (end_of_turn) on long input, attempts to
         continue the translation by prompting with the source + partial output.
+        TG-014: Supports quantization parameter.
         """
         import re
 
@@ -1855,6 +1889,7 @@ class TranslateGemmaNode:
                     keep_model_loaded=keep_model_loaded,
                     debug=debug,
                     long_text_strategy="disable",  # Prevent recursion
+                    quantization=quantization,  # TG-014
                     _retry_plain_on_empty=False,
                 )
                 continuation = result[0] if result else ""
@@ -1924,12 +1959,14 @@ class TranslateGemmaNode:
         strict_context_limit: bool,
         keep_model_loaded: bool,
         debug: bool,
+        quantization: str = "none",  # TG-014
     ) -> str:
         """
         TG-050: Segmented strategy for long text translation.
 
         Splits input by paragraph (blank lines), translates each segment,
         and reassembles with original separators preserved.
+        TG-014: Supports quantization parameter.
         """
         import re
 
@@ -1969,6 +2006,7 @@ class TranslateGemmaNode:
                     keep_model_loaded=keep_model_loaded,
                     debug=debug,
                     long_text_strategy="disable",  # Prevent recursion
+                    quantization=quantization,  # TG-014
                     _retry_plain_on_empty=True,
                 )
                 translated = result[0] if result else part

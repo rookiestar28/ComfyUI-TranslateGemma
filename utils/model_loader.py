@@ -34,8 +34,12 @@ MODEL_REPOS = {
 _MODEL_CACHE_LOCK = threading.RLock()
 
 # Single-model cache (TG-004: only one model in memory at a time)
+# TG-014: Cache key now includes quantization and revision for correct reload
 _current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
-_current_model_size: Optional[str] = None
+_current_model_key: Optional[tuple[str, str, Optional[str]]] = None  # (model_size, quantization, revision)
+
+# TG-014: Valid quantization options
+QUANTIZATION_OPTIONS = ("none", "bnb-8bit", "bnb-4bit")
 
 
 def _is_remote_code_allowed(repo_id: str = None) -> tuple[bool, str]:
@@ -405,27 +409,33 @@ def ensure_model_downloaded(
 def unload_current_model():
     """
     Unload the currently loaded model and free memory (TG-004).
-    
+
     This ensures only one model is in memory at a time.
     TG-029: Thread-safe with _MODEL_CACHE_LOCK.
+    TG-014: Now uses _current_model_key tuple instead of _current_model_size.
     """
-    global _current_model, _current_model_size
-    
+    global _current_model, _current_model_key
+
     with _MODEL_CACHE_LOCK:
         if _current_model is not None:
             model, processor_or_tokenizer = _current_model
-            model_size = _current_model_size
-            
+            model_key = _current_model_key
+
             # Clear references
             _current_model = None
-            _current_model_size = None
+            _current_model_key = None
             del model
             del processor_or_tokenizer
-            
+
             # Clean up memory
             cleanup_torch_memory()
-            
-            print(f"[TranslateGemma] {model_size} model unloaded, memory cleaned")
+
+            if model_key:
+                model_size = model_key[0]
+                quantization = model_key[1] if len(model_key) > 1 else "none"
+                print(f"[TranslateGemma] {model_size} model (quantization={quantization}) unloaded, memory cleaned")
+            else:
+                print("[TranslateGemma] Model unloaded, memory cleaned")
 
 
 def _detect_auth_error(error: Exception) -> bool:
@@ -495,52 +505,182 @@ def _raise_auth_error(repo_id: str, original_error: Exception):
     )
 
 
+def _get_bnb_compute_dtype() -> torch.dtype:
+    """
+    Get compute dtype for BitsAndBytes 4-bit quantization (TG-014).
+
+    Priority:
+    1. TRANSLATEGEMMA_BNB_4BIT_COMPUTE_DTYPE env var (bf16 or fp16)
+    2. Auto-detect: BF16 if CUDA supports it, else FP16
+    """
+    env_dtype = os.environ.get("TRANSLATEGEMMA_BNB_4BIT_COMPUTE_DTYPE", "").strip().lower()
+    if env_dtype == "bf16":
+        return torch.bfloat16
+    elif env_dtype == "fp16":
+        return torch.float16
+    # Auto-detect
+    if cuda_supports_bf16():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _get_bnb_double_quant() -> bool:
+    """
+    Get double quantization setting for BitsAndBytes 4-bit (TG-014).
+
+    Default: True (enabled)
+    Env override: TRANSLATEGEMMA_BNB_4BIT_DOUBLE_QUANT=0 to disable
+    """
+    env_val = os.environ.get("TRANSLATEGEMMA_BNB_4BIT_DOUBLE_QUANT", "").strip()
+    if env_val == "0":
+        return False
+    return True
+
+
+def _check_bnb_availability(quantization: str, device: str) -> None:
+    """
+    Check if bitsandbytes quantization is available (TG-014).
+
+    Raises RuntimeError with actionable message if:
+    - Device is not CUDA
+    - bitsandbytes is not installed
+    - BitsAndBytesConfig is not available in transformers
+    """
+    if quantization == "none":
+        return
+
+    # 1. Check CUDA requirement
+    if not device.startswith("cuda"):
+        raise RuntimeError(
+            f"bitsandbytes quantization (quantization={quantization}) requires a CUDA GPU.\n"
+            f"Current device: {device}\n\n"
+            "To resolve:\n"
+            "- Use a machine with an NVIDIA GPU and CUDA installed, OR\n"
+            "- Set quantization=none to load the model without quantization"
+        )
+
+    # 2. Check bitsandbytes import
+    try:
+        import bitsandbytes  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            f"bitsandbytes quantization (quantization={quantization}) requires bitsandbytes to be installed.\n\n"
+            "To resolve:\n"
+            "- Install bitsandbytes: pip install bitsandbytes\n"
+            "- Windows users: see https://github.com/jllllll/bitsandbytes-windows-webui for prebuilt wheels\n"
+            "- Or set quantization=none to load the model without quantization\n\n"
+            f"Import error: {e}"
+        ) from e
+
+    # 3. Check BitsAndBytesConfig in transformers
+    try:
+        from transformers import BitsAndBytesConfig  # noqa: F401
+    except ImportError as e:
+        try:
+            import transformers
+            tf_version = getattr(transformers, "__version__", "unknown")
+        except Exception:
+            tf_version = "unknown"
+        raise RuntimeError(
+            f"bitsandbytes quantization (quantization={quantization}) requires BitsAndBytesConfig from transformers.\n"
+            f"Current transformers version: {tf_version}\n\n"
+            "To resolve:\n"
+            "- Upgrade transformers: pip install --upgrade transformers\n"
+            "- Or set quantization=none to load the model without quantization\n\n"
+            f"Import error: {e}"
+        ) from e
+
+
+def _build_quantization_config(quantization: str):
+    """
+    Build BitsAndBytesConfig for the requested quantization mode (TG-014).
+
+    Args:
+        quantization: One of "none", "bnb-8bit", "bnb-4bit"
+
+    Returns:
+        BitsAndBytesConfig or None (for quantization="none")
+    """
+    if quantization == "none":
+        return None
+
+    from transformers import BitsAndBytesConfig
+
+    if quantization == "bnb-8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    elif quantization == "bnb-4bit":
+        compute_dtype = _get_bnb_compute_dtype()
+        use_double_quant = _get_bnb_double_quant()
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=use_double_quant,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+    else:
+        raise ValueError(f"Invalid quantization mode: {quantization}. Choose from: {QUANTIZATION_OPTIONS}")
+
+
 def load_model(
     model_size: str,
     revision: Optional[str] = None,
+    quantization: str = "none",
 ) -> tuple:
     """
     Load TranslateGemma model and tokenizer with single-model cache (TG-004).
-    
+
     Args:
         model_size: One of "4B", "12B", "27B"
         revision: Optional HuggingFace revision/commit hash for reproducibility (TG-006)
-        
+        quantization: Quantization mode (TG-014): "none", "bnb-8bit", or "bnb-4bit"
+
     Returns:
-        Tuple of (model, tokenizer)
+        Tuple of (model, processor)
     """
-    global _current_model, _current_model_size
-    
+    global _current_model, _current_model_key
+
+    # Validate quantization option
+    if quantization not in QUANTIZATION_OPTIONS:
+        raise ValueError(f"Invalid quantization mode: {quantization}. Choose from: {QUANTIZATION_OPTIONS}")
+
     # Check env var for revision override
     env_revision = os.environ.get("TRANSLATEGEMMA_REVISION")
     if env_revision and not revision:
         revision = env_revision
-    
+
+    # TG-014: Build cache key tuple
+    model_key = (model_size, quantization, revision)
+
     # TG-029: Thread-safe cache check and switch
     with _MODEL_CACHE_LOCK:
-        # Return cached model if same size is requested
-        if _current_model is not None and _current_model_size == model_size:
-            print(f"[TranslateGemma] Using cached {model_size} model")
+        # Return cached model if same key is requested (TG-014: includes quantization)
+        if _current_model is not None and _current_model_key == model_key:
+            print(f"[TranslateGemma] Using cached {model_size} model (quantization={quantization})")
             return _current_model
-        
+
         # Unload current model before loading new one (single-model cache)
         if _current_model is not None:
-            print(f"[TranslateGemma] Switching from {_current_model_size} to {model_size}")
+            old_size = _current_model_key[0] if _current_model_key else "unknown"
+            old_quant = _current_model_key[1] if _current_model_key and len(_current_model_key) > 1 else "none"
+            print(f"[TranslateGemma] Switching from {old_size} (quantization={old_quant}) to {model_size} (quantization={quantization})")
         unload_current_model()
-    
+
     repo_id = MODEL_REPOS.get(model_size)
     if not repo_id:
         raise ValueError(f"Invalid model size: {model_size}. Choose from: {list(MODEL_REPOS.keys())}")
-    
+
     device = get_device()
     cache_dir = get_model_path(repo_id)  # TG-005: isolated per repo
     dtype = get_torch_dtype(device)
-    
+
     print(f"[TranslateGemma] Loading {model_size} model from {repo_id}...")
-    print(f"[TranslateGemma] Device: {device}, dtype: {dtype}")
+    print(f"[TranslateGemma] Device: {device}, dtype: {dtype}, quantization: {quantization}")
     print(f"[TranslateGemma] Cache dir: {cache_dir}")
     if revision:
         print(f"[TranslateGemma] Revision: {revision}")
+
+    # TG-014: Check bitsandbytes availability before loading
+    _check_bnb_availability(quantization, device)
 
     try:
         if AutoProcessor is None or AutoModelForImageTextToText is None:
@@ -554,7 +694,7 @@ def load_model(
 
         # TG-006 + TG-026: Try without trust_remote_code first, fall back if policy allows
         remote_code_allowed, policy_reason = _is_remote_code_allowed(repo_id)
-        
+
         try:
             processor = AutoProcessor.from_pretrained(
                 repo_id,
@@ -576,62 +716,75 @@ def load_model(
                 trust_remote_code=True,
             )
 
+        # TG-014: Build quantization config
+        quantization_config = _build_quantization_config(quantization)
+        if quantization_config:
+            compute_dtype = _get_bnb_compute_dtype()
+            print(f"[TranslateGemma] Using BitsAndBytes quantization: {quantization}, compute_dtype={compute_dtype}")
+
         # TG-017 + TG-026: Prefer safetensors, apply remote-code policy
+        # TG-014: Add quantization_config when using bitsandbytes
+        model_kwargs = dict(
+            cache_dir=cache_dir,
+            revision=revision,
+            torch_dtype=dtype,
+            device_map="auto" if device.startswith("cuda") else None,
+            trust_remote_code=False,
+            use_safetensors=True,
+        )
+        if quantization_config:
+            model_kwargs["quantization_config"] = quantization_config
+
         try:
             model = AutoModelForImageTextToText.from_pretrained(
                 repo_id,
-                cache_dir=cache_dir,
-                revision=revision,
-                torch_dtype=dtype,
-                device_map="auto" if device.startswith("cuda") else None,
-                trust_remote_code=False,
-                use_safetensors=True,
+                **model_kwargs,
             )
         except Exception as e:
             if "safetensors" in str(e).lower():
                 print("[TranslateGemma] safetensors not available, falling back to .bin")
-            
+
             if not remote_code_allowed:
                 raise RuntimeError(
                     f"Loading '{repo_id}' model weights requires remote code, but policy denies it ({policy_reason}). "
                     f"Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 to allow."
                 ) from e
-            
+
             print(f"[TranslateGemma] Loading model with trust_remote_code=True (policy: {policy_reason})")
+            model_kwargs["trust_remote_code"] = True
+            model_kwargs.pop("use_safetensors", None)  # Remove safetensors preference for fallback
             model = AutoModelForImageTextToText.from_pretrained(
                 repo_id,
-                cache_dir=cache_dir,
-                revision=revision,
-                torch_dtype=dtype,
-                device_map="auto" if device.startswith("cuda") else None,
-                trust_remote_code=True,
+                **model_kwargs,
             )
 
-        if not device.startswith("cuda"):
+        # TG-014: Do not call model.to(device) for quantized models (already device-mapped)
+        if not device.startswith("cuda") and quantization == "none":
             model = model.to(device)
 
         # TG-007: Set model to eval mode for inference
         model.eval()
 
         # TG-029: Thread-safe cache write
+        # TG-014: Store full model key including quantization
         with _MODEL_CACHE_LOCK:
-            # Cache the loaded model (single-model cache)
             _current_model = (model, processor)
-            _current_model_size = model_size
+            _current_model_key = model_key
 
-        print(f"[TranslateGemma] {model_size} model loaded successfully on {device} (eval mode)")
+        print(f"[TranslateGemma] {model_size} model loaded successfully on {device} (eval mode, quantization={quantization})")
         return model, processor
 
     except Exception as e:
         # Clean up any partially loaded resources
         cleanup_torch_memory()
-        
+
         # TG-004: Detect gated/auth errors and provide actionable guidance
         if _detect_auth_error(e):
             _raise_auth_error(repo_id, e)
-        
+
         # TG-008: Include context in error message
         context = _build_load_context(model_size, repo_id, device, dtype, cache_dir, revision)
+        context += f" | quantization: {quantization}"
         raise RuntimeError(f"Failed to load TranslateGemma: {e}\n[Context] {context}") from e
 
 
@@ -652,7 +805,16 @@ def get_available_models() -> list[str]:
 
 def get_current_model_size() -> Optional[str]:
     """Return the currently loaded model size, or None if no model is loaded."""
-    return _current_model_size
+    if _current_model_key is None:
+        return None
+    return _current_model_key[0]
+
+
+def get_current_quantization() -> Optional[str]:
+    """Return the currently loaded model's quantization mode, or None if no model is loaded (TG-014)."""
+    if _current_model_key is None:
+        return None
+    return _current_model_key[1] if len(_current_model_key) > 1 else "none"
 
 
 def is_model_loaded() -> bool:

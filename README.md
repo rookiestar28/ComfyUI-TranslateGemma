@@ -138,6 +138,7 @@ Category: `text/translation`
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 | `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
+| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes (TG-014). `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). Requires CUDA + bitsandbytes installed. |
 
 ### Outputs
 
@@ -303,6 +304,7 @@ The following are the authoritative default values for node inputs:
 | `chinese_conversion_only` | `false` | OpenCC conversion without model |
 | `chinese_conversion_direction` | `auto_flip` | Auto-detect and flip variant |
 | `long_text_strategy` | `disable` | Single-call (no continuation) |
+| `quantization` | `none` | No quantization (full precision) |
 
 ## Performance Tips
 
@@ -316,6 +318,61 @@ The following are the authoritative default values for node inputs:
   - 4B model: ~12 GB
   - 12B model: ~27 GB
   - 27B model: ~56 GB
+
+## Quantization (bitsandbytes) — TG-014
+
+**Best-effort VRAM reduction** for running larger models (12B/27B) on consumer GPUs.
+
+### How It Works
+
+The `quantization` input allows you to load the model in lower precision using [bitsandbytes](https://github.com/TimDettmers/bitsandbytes):
+
+| Mode | VRAM Reduction | Quality | Notes |
+|------|----------------|---------|-------|
+| `none` (default) | — | Best | Full precision (BF16/FP16) |
+| `bnb-8bit` | ~50% | Good | 8-bit quantization |
+| `bnb-4bit` | ~75% | Acceptable | 4-bit NF4 quantization |
+
+### Requirements
+
+- **CUDA GPU**: bitsandbytes quantization only works on NVIDIA GPUs with CUDA
+- **bitsandbytes installed**: `pip install bitsandbytes`
+- **transformers with BitsAndBytesConfig**: `pip install --upgrade transformers`
+
+### Troubleshooting
+
+"bitsandbytes quantization requires a CUDA GPU":
+
+- You're running on CPU or MPS (Apple Silicon)
+- Set `quantization=none` or use a CUDA-capable GPU
+
+"bitsandbytes not installed":
+
+- Install: `pip install bitsandbytes`
+- Windows users: see [bitsandbytes-windows-webui](https://github.com/jllllll/bitsandbytes-windows-webui) for prebuilt wheels (third-party, evaluate risk yourself)
+- ComfyUI Desktop users: quantization may require manual bitsandbytes installation; if install fails, use `quantization=none` or run the 4B model
+
+"BitsAndBytesConfig not found":
+
+- Upgrade transformers: `pip install --upgrade transformers`
+
+"CUDA Setup failed" or "libbitsandbytes_cudaXXX not found" (import succeeds but loading fails):
+
+- This means bitsandbytes was built for a different CUDA version or your GPU's compute capability is unsupported
+- Set `quantization=none` as a workaround
+- Include the full error message when reporting issues
+
+### Environment Variables (Advanced)
+
+- `TRANSLATEGEMMA_BNB_4BIT_COMPUTE_DTYPE`: Force compute dtype for 4-bit (`bf16` or `fp16`). Default: auto-detect.
+- `TRANSLATEGEMMA_BNB_4BIT_DOUBLE_QUANT`: Enable double quantization (`1` = enabled, `0` = disabled). Default: `1`.
+
+### Limitations
+
+- Quantization is **best-effort**: TranslateGemma official docs do not explicitly promise bitsandbytes support
+- Translation quality may degrade slightly with quantization
+- Not supported on CPU or MPS (Apple Silicon) — only CUDA GPUs
+- Windows/Desktop users may encounter install issues with bitsandbytes
 
 ## Security / Reproducibility Notes
 
