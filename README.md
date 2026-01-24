@@ -15,7 +15,9 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
 - Added `max_new_tokens=0` / `max_input_tokens=0` as **Auto** token budgeting (context-aware).
 - Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
+- Added optional BitsAndBytes quantization (`quantization`: `none` / `bnb-8bit` / `bnb-4bit`) for best-effort VRAM reduction.
 - Added a node UI `?` help modal and `0 = auto` labels for max token widgets.
+- Improved Hugging Face download diagnostics (network/auth/disk hints + retries) and added troubleshooting guidance (proxy/mirror/offline).
 
 ---
 
@@ -39,6 +41,7 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - [Default Settings (TG-032)](#default-settings-tg-032)
 - [Performance Tips](#performance-tips)
 - [VRAM Notes (Native Models)](#vram-notes-native-models)
+- [Quantization (bitsandbytes) — TG-014](#quantization-bitsandbytes--tg-014)
 - [Security / Reproducibility Notes](#security--reproducibility-notes)
 - [License](#license)
 
