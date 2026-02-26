@@ -239,24 +239,34 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
     
     missing = []
     
-    # 1. Check required metadata
-    required_metadata = ["config.json"]
-    tokenizer_files = [
+    # 1. Check required metadata (stricter for manual/offline snapshots)
+    # NOTE: We intentionally require more than "just config + weights" so that
+    # users who manually copy a partial folder get an actionable "incomplete
+    # snapshot" message before runtime load fails with a vague network/cache error.
+    required_metadata = [
+        "config.json",
         "tokenizer_config.json",
-        "processor_config.json", 
+        "special_tokens_map.json",
+        "processor_config.json",
         "preprocessor_config.json",
     ]
-    
+
     for f in required_metadata:
         if not os.path.exists(os.path.join(local_dir, f)):
             missing.append(f)
-    
-    # At least one tokenizer/processor config should exist
-    tokenizer_found = any(
-        os.path.exists(os.path.join(local_dir, f)) for f in tokenizer_files
+
+    # Tokenizer vocabulary/model artifact (name varies by tokenizer implementation).
+    tokenizer_artifacts_any = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+    ]
+    tokenizer_artifact_found = any(
+        os.path.exists(os.path.join(local_dir, f)) for f in tokenizer_artifacts_any
     )
-    if not tokenizer_found:
-        missing.append("tokenizer/processor config (any of: " + ", ".join(tokenizer_files) + ")")
+    if not tokenizer_artifact_found:
+        missing.append("tokenizer artifact (any of: " + ", ".join(tokenizer_artifacts_any) + ")")
     
     # 2. Check weights completeness
     index_file = os.path.join(local_dir, "model.safetensors.index.json")
@@ -345,12 +355,18 @@ def ensure_model_downloaded(
         return True
     
     # Snapshot incomplete or missing
+    initial_missing = list(missing)
+
     if os.path.isdir(local_dir) and missing:
         print(f"[TranslateGemma] Incomplete snapshot detected, will resume download...")
-        if debug:
-            capped = missing[:3]
-            suffix = f" (+{len(missing)-3} more)" if len(missing) > 3 else ""
-            print(f"[TranslateGemma] Missing: {', '.join(capped)}{suffix}")
+        capped = missing[:5]
+        suffix = f" (+{len(missing)-5} more)" if len(missing) > 5 else ""
+        print(f"[TranslateGemma] Missing files/components: {', '.join(capped)}{suffix}")
+        print(
+            "[TranslateGemma] Manual/offline snapshots must include tokenizer + processor metadata "
+            "(e.g. tokenizer_config.json, special_tokens_map.json, processor_config.json, "
+            "preprocessor_config.json, and a tokenizer model/json file)."
+        )
     
     # Try huggingface_hub.snapshot_download
     try:
@@ -505,6 +521,14 @@ def ensure_model_downloaded(
     assert last_exc is not None
     kind, hint = _classify_download_error(last_exc)
 
+    if initial_missing:
+        capped = initial_missing[:5]
+        suffix = f" (+{len(initial_missing)-5} more)" if len(initial_missing) > 5 else ""
+        print(
+            "[TranslateGemma] Local snapshot is still incomplete and online recovery failed. "
+            f"Missing: {', '.join(capped)}{suffix}"
+        )
+
     # Keep the legacy auth flow message (more explicit)
     if kind == "auth":
         raise RuntimeError(
@@ -531,11 +555,21 @@ def ensure_model_downloaded(
 
     extra_context = ("\n\n[Env]\n" + "\n".join(extra_lines)) if extra_lines else ""
 
+    local_snapshot_context = ""
+    if initial_missing:
+        local_snapshot_context = (
+            "\n\n[Local snapshot check]\n"
+            f"Incomplete local snapshot detected (missing: {', '.join(initial_missing[:8])}"
+            + (f", +{len(initial_missing)-8} more" if len(initial_missing) > 8 else "")
+            + ")."
+        )
+
     raise RuntimeError(
         f"Failed to download model '{repo_id}'.\n\n"
         f"[Cause]\n{type(last_exc).__name__}: {last_exc}\n\n"
         f"[Hint]\n{hint}\n\n"
         f"[Cache dir]\n{local_dir}"
+        f"{local_snapshot_context}"
         f"{extra_context}"
     ) from last_exc
 
@@ -826,14 +860,31 @@ def load_model(
         # TG-016: Explicit download before loading (Windows-friendly, skip if present)
         ensure_model_downloaded(repo_id, cache_dir, revision)
 
+        # BUGFIX (manual/offline snapshot loading):
+        # `cache_dir` in from_pretrained(...) is only a cache root hint; it does NOT
+        # mean "load directly from this folder". If we pass `repo_id`, transformers
+        # may still resolve through HF endpoints (e.g. HF_ENDPOINT mirrors), which
+        # breaks users who manually copied a complete snapshot for offline use.
+        #
+        # When the local snapshot folder is complete, load from the local path itself
+        # and force local_files_only=True so no network lookup is attempted.
+        snapshot_complete, _ = _is_snapshot_complete(cache_dir, debug=False)
+        load_source = cache_dir if snapshot_complete else repo_id
+        local_files_only = bool(snapshot_complete)
+        if snapshot_complete:
+            print(f"[TranslateGemma] Using local snapshot for load: {cache_dir} (local_files_only=True)")
+        else:
+            print(f"[TranslateGemma] Local snapshot incomplete; loading via repo id: {repo_id}")
+
         # TG-006 + TG-026: Try without trust_remote_code first, fall back if policy allows
         remote_code_allowed, policy_reason = _is_remote_code_allowed(repo_id)
 
         try:
             processor = AutoProcessor.from_pretrained(
-                repo_id,
+                load_source,
                 cache_dir=cache_dir,
                 revision=revision,
+                local_files_only=local_files_only,
                 trust_remote_code=False,
             )
         except Exception as load_err:
@@ -844,9 +895,10 @@ def load_model(
                 ) from load_err
             print(f"[TranslateGemma] Loading processor with trust_remote_code=True (policy: {policy_reason})")
             processor = AutoProcessor.from_pretrained(
-                repo_id,
+                load_source,
                 cache_dir=cache_dir,
                 revision=revision,
+                local_files_only=local_files_only,
                 trust_remote_code=True,
             )
 
@@ -861,6 +913,7 @@ def load_model(
         model_kwargs = dict(
             cache_dir=cache_dir,
             revision=revision,
+            local_files_only=local_files_only,
             torch_dtype=dtype,
             device_map="auto" if device.startswith("cuda") else None,
             trust_remote_code=False,
@@ -871,7 +924,7 @@ def load_model(
 
         try:
             model = AutoModelForImageTextToText.from_pretrained(
-                repo_id,
+                load_source,
                 **model_kwargs,
             )
         except Exception as e:
@@ -888,7 +941,7 @@ def load_model(
             model_kwargs["trust_remote_code"] = True
             model_kwargs.pop("use_safetensors", None)  # Remove safetensors preference for fallback
             model = AutoModelForImageTextToText.from_pretrained(
-                repo_id,
+                load_source,
                 **model_kwargs,
             )
 

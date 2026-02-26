@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-translategemma"
 description = "ComfyUI node for TranslateGemma — Google's open source translation models with 55 languages & multimodal image translation."
-version = "1.2.2"
+version = "1.2.3"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)

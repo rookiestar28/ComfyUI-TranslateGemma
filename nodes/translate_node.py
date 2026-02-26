@@ -2,7 +2,6 @@ import torch
 import os
 import tempfile
 import time
-import threading
 from typing import Any
 from ..utils.language_utils import get_language_names, get_language_code
 from ..utils.language_detect import detect_source_lang_code
@@ -63,15 +62,15 @@ from ..utils.debug_utils import (
 )
 from ..utils.truncation_compat import (
     tokenizer_truncation_side,
-    truncate_text_tokens_to_fit,
-    TruncationMeta,
-    log_truncation_if_occurred,
+    build_structured_inputs_with_truncation,
 )
 
 
 # TG-028: Debug privacy controls
 # TG-041: Redaction functions moved to utils/debug_utils.py for consistency
-_TOKENIZER_MUTATION_LOCK = threading.RLock()
+# NOTE: Tokenizer truncation lock is centralized in utils/truncation_compat.py.
+# Use tokenizer_truncation_side(...) / build_structured_inputs_with_truncation(...)
+# to avoid duplicate locks with inconsistent synchronization.
 
 def _clamp_int(value: int, min_val: int, max_val: int) -> int:
     return max(min_val, min(max_val, int(value)))
@@ -754,81 +753,33 @@ class TranslateGemmaNode:
         actual_input_len = None
         try:
             if mode != PromptMode.PLAIN and hasattr(processor, "apply_chat_template"):
-                kwargs_base = dict(
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
-
                 # IMPORTANT: Avoid truncating the whole templated prompt. If truncation cuts off the
                 # end-of-turn + generation prompt tokens, the model may continue the user's text
                 # (often in the source language), causing target-language drift (Case T3).
                 # Instead, truncate only the user-provided text so the template wrapper remains intact.
-                with _TOKENIZER_MUTATION_LOCK:
-                    overhead_messages = build_structured_messages(
-                        input_text="",
-                        target_lang_code=target_code,
-                        source_lang_code=source_code,
-                    )
-                    overhead_inputs = processor.apply_chat_template(overhead_messages, **kwargs_base)
-                    overhead_len = int(overhead_inputs["input_ids"].shape[1])
-                    available_for_text = int(max_input_tokens) - overhead_len
+                # TG-042/TG-053: Use the shared helper so structured truncation behavior
+                # stays in one place (reduces drift/regression risk vs. duplicated logic).
+                structured_inputs, trunc_meta = build_structured_inputs_with_truncation(
+                    processor=processor,
+                    tokenizer=tokenizer,
+                    input_text=input_text,
+                    target_lang_code=target_code,
+                    source_lang_code=source_code,
+                    max_input_tokens=int(max_input_tokens),
+                    truncate_input=bool(truncate_input),
+                    build_messages_fn=build_structured_messages,
+                    debug=debug,
+                )
+                inputs = structured_inputs
+                raw_input_len = int(trunc_meta.raw_input_tokens or 0)
+                actual_input_len = int(trunc_meta.actual_input_tokens or 0) if trunc_meta.actual_input_tokens else None
+                overhead_len = int(trunc_meta.overhead_tokens or 0)
 
-                    # TG-040: Use TOKEN_COUNT_UNLIMITED sentinel for "no limit" probing
-                    _, raw_text_tokens, _ = truncate_text_tokens_to_fit(
-                        tokenizer=tokenizer,
-                        text=input_text,
-                        max_tokens=TOKEN_COUNT_UNLIMITED,
-                    )
-                    raw_input_len = overhead_len + int(raw_text_tokens)
-                    structured_truncation_needed = truncate_input and int(raw_input_len) > int(max_input_tokens)
-
-                    if truncate_input and int(max_input_tokens) <= overhead_len:
-                        raise RuntimeError(
-                            "max_input_tokens is too low for the official structured chat template. "
-                            f"(max_input_tokens={max_input_tokens}, template_overhead_tokens={overhead_len}) "
-                            "Increase max_input_tokens or use prompt_mode=plain."
-                        )
-
-                    truncated_text = input_text
-                    if structured_truncation_needed and available_for_text > 0:
-                        truncated_text, _, _ = truncate_text_tokens_to_fit(
-                            tokenizer=tokenizer,
-                            text=input_text,
-                            max_tokens=available_for_text,
-                        )
-
-                    # TG-042: Structured truncation debug logging moved to after guard check
-                    # to include guard_outcome in the unified log format
-
-                    # TG-040: Use named constants for truncation loop parameters
-                    for _ in range(STRUCTURED_TRUNCATION_MAX_ITERATIONS):
-                        messages = build_structured_messages(
-                            input_text=truncated_text,
-                            target_lang_code=target_code,
-                            source_lang_code=source_code,
-                        )
-                        inputs = processor.apply_chat_template(messages, **kwargs_base)
-                        actual_input_len = int(inputs["input_ids"].shape[1])
-                        if actual_input_len <= int(max_input_tokens) or not truncate_input:
-                            break
-                        overflow = actual_input_len - int(max_input_tokens)
-                        # TG-040: Use named constant for iteration buffer
-                        available_for_text = max(available_for_text - overflow - STRUCTURED_TRUNCATION_ITERATION_BUFFER, 0)
-                        if available_for_text <= 0:
-                            break
-                        truncated_text, _, _ = truncate_text_tokens_to_fit(
-                            tokenizer=tokenizer,
-                            text=input_text,
-                            max_tokens=available_for_text,
-                        )
-
-                    # TG-051: If we didn't need to truncate, treat the structured raw token estimate as
-                    # authoritative based on the actual templated inputs. This prevents false-positive
-                    # truncation warnings caused by minor counting differences (e.g. raw=190 vs actual=189).
-                    if not structured_truncation_needed and actual_input_len is not None:
-                        raw_input_len = int(actual_input_len)
+                # TG-051: If we didn't need to truncate, treat the actual templated input
+                # length as authoritative to avoid false-positive truncation warnings from
+                # tiny tokenizer counting differences.
+                if not trunc_meta.was_truncated and actual_input_len is not None:
+                    raw_input_len = int(actual_input_len)
                 used_path = "processor.apply_chat_template(structured)"
 
                 # TG-034: Validate structured generation prompt wrapper
@@ -903,37 +854,31 @@ class TranslateGemmaNode:
                     print(f"[TranslateGemma] Prompt preview: {preview}")
 
             if truncate_input:
-                with _TOKENIZER_MUTATION_LOCK:
-                    old_truncation_side = getattr(tokenizer, "truncation_side", None)
-                    if old_truncation_side and old_truncation_side != "right":
-                        if debug:
-                            print(
-                                "[TranslateGemma] Forcing tokenizer.truncation_side='right' "
-                                "(to preserve instruction tokens under truncation)"
-                            )
-                        tokenizer.truncation_side = "right"
-                    try:
-                        inputs = tokenizer(
+                old_truncation_side = getattr(tokenizer, "truncation_side", None)
+                if old_truncation_side and old_truncation_side != "right" and debug:
+                    print(
+                        "[TranslateGemma] Forcing tokenizer.truncation_side='right' "
+                        "(to preserve instruction tokens under truncation)"
+                    )
+                with tokenizer_truncation_side(tokenizer, "right"):
+                    inputs = tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_input_tokens,
+                    )
+                    actual_input_len = int(inputs["input_ids"].shape[1])
+                    raw_input_len = actual_input_len
+
+                    if actual_input_len == int(max_input_tokens):
+                        probe_max = int(max_input_tokens) + 1024
+                        probe_result = tokenizer(
                             prompt,
                             return_tensors="pt",
                             truncation=True,
-                            max_length=max_input_tokens,
+                            max_length=probe_max,
                         )
-                        actual_input_len = int(inputs["input_ids"].shape[1])
-                        raw_input_len = actual_input_len
-
-                        if actual_input_len == int(max_input_tokens):
-                            probe_max = int(max_input_tokens) + 1024
-                            probe_result = tokenizer(
-                                prompt,
-                                return_tensors="pt",
-                                truncation=True,
-                                max_length=probe_max,
-                            )
-                            raw_input_len = int(probe_result["input_ids"].shape[1])
-                    finally:
-                        if old_truncation_side and old_truncation_side != tokenizer.truncation_side:
-                            tokenizer.truncation_side = old_truncation_side
+                        raw_input_len = int(probe_result["input_ids"].shape[1])
             else:
                 inputs = tokenizer(prompt, return_tensors="pt")
                 actual_input_len = int(inputs["input_ids"].shape[1])
@@ -1256,6 +1201,7 @@ class TranslateGemmaNode:
         keep_model_loaded: bool,
         debug: bool,
         quantization: str = "none",  # TG-014
+        _eot_relaxed_retry: bool = False,
     ) -> tuple[str]:
         """
         Translate text found in an image using TranslateGemma multimodal chat template.
@@ -1542,7 +1488,11 @@ class TranslateGemmaNode:
                     do_sample=False,
                     use_cache=True,
                 )
-                eos_ids = _get_generation_eos_token_ids(tokenizer, debug=debug)
+                eos_ids = _get_generation_eos_token_ids(
+                    tokenizer,
+                    debug=debug,
+                    include_end_of_turn=(not _eot_relaxed_retry),
+                )
                 if eos_ids:
                     gen_kwargs["eos_token_id"] = eos_ids if len(eos_ids) > 1 else eos_ids[0]
                     gen_kwargs["pad_token_id"] = int(getattr(tokenizer, "eos_token_id", eos_ids[0]) or eos_ids[0])
@@ -1551,6 +1501,18 @@ class TranslateGemmaNode:
                     prompt_len=int(input_len),
                     debug=debug,
                 )
+                if _eot_relaxed_retry:
+                    eot_criteria = _build_end_of_turn_stopping_criteria(
+                        tokenizer=tokenizer,
+                        prompt_len=int(input_len),
+                        min_gen=8,
+                        debug=debug,
+                    )
+                    if eot_criteria is not None:
+                        if stopping_criteria is None:
+                            stopping_criteria = eot_criteria
+                        else:
+                            stopping_criteria.extend(eot_criteria)
                 if stopping_criteria is not None:
                     gen_kwargs["stopping_criteria"] = stopping_criteria
 
@@ -1589,7 +1551,38 @@ class TranslateGemmaNode:
 
             image_result = translated_text.strip()
             if not image_result:
-                return ("",)
+                # Risk fix (#4): avoid silent empty-string success on image path.
+                # Retry once with relaxed <end_of_turn> handling (same idea as text path),
+                # then return an explicit error string so downstream nodes don't see a
+                # misleading "successful but empty" output.
+                if not _eot_relaxed_retry:
+                    print(
+                        "[TranslateGemma] WARNING: Image translation returned empty output "
+                        f"(stop_reason={gen_meta.stop_reason.value}, generated_tokens={gen_meta.generated_tokens}). "
+                        "Retrying with relaxed <end_of_turn> stopping."
+                    )
+                    return self._translate_image(
+                        image=image,
+                        target_language=target_language,
+                        model_size=model_size,
+                        source_language=source_language,
+                        image_enhance=image_enhance,
+                        image_resize_mode=image_resize_mode,
+                        image_two_pass=image_two_pass,
+                        max_new_tokens=max_new_tokens,
+                        max_input_tokens=max_input_tokens,
+                        truncate_input=truncate_input,
+                        strict_context_limit=strict_context_limit,
+                        keep_model_loaded=keep_model_loaded,
+                        debug=debug,
+                        quantization=quantization,
+                        _eot_relaxed_retry=True,
+                    )
+                return (
+                    "[Error: Image translation returned empty output. "
+                    "Try setting an explicit source_language, enabling image_two_pass, "
+                    "or increasing max_new_tokens.]",
+                )
 
             if image_two_pass and source_code != target_code:
                 if debug:
