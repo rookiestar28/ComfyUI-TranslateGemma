@@ -4,6 +4,16 @@
 import { app } from "../../../scripts/app.js";
 
 const EXT_NAME = "TranslateGemma.HelpButton";
+const NODE_NAME = "TranslateGemma";
+const PATCH_FLAG = "__tgHelpPatched";
+const LABEL_FALLBACKS = {
+	max_new_tokens: "max_new_tokens (0 = auto)",
+	max_input_tokens: "max_input_tokens (0 = auto)",
+};
+
+function isTranslateGemmaNode(nodeData) {
+	return nodeData?.name === NODE_NAME;
+}
 
 function escapeHtml(text) {
 	if (text === null || text === undefined) return "";
@@ -19,14 +29,17 @@ function applyWidgetLabelOverrides(node) {
 	if (!node?.widgets) return;
 	for (const w of node.widgets) {
 		if (!w || !w.name) continue;
-		if (w.name === "max_new_tokens") {
-			// Keep w.name unchanged (used as the backend prompt key).
-			w.label = "max_new_tokens (0 = auto)";
-			w.options = { ...(w.options || {}), label: w.label };
-		} else if (w.name === "max_input_tokens") {
-			w.label = "max_input_tokens (0 = auto)";
-			w.options = { ...(w.options || {}), label: w.label };
-		}
+		const fallbackLabel = LABEL_FALLBACKS[w.name];
+		if (!fallbackLabel) continue;
+
+		// Backend `display_name` is the primary label source on current ComfyUI.
+		// This JS path is only a fallback for older frontends that still show raw keys.
+		const existingLabel = w.label || w.options?.label || "";
+		if (existingLabel && existingLabel !== w.name && existingLabel !== fallbackLabel) continue;
+
+		// Keep w.name unchanged (used as the backend prompt key).
+		w.label = fallbackLabel;
+		w.options = { ...(w.options || {}), label: fallbackLabel };
 	}
 }
 
@@ -104,7 +117,8 @@ function buildHelpHtml(nodeData) {
 		<div style="margin-top:10px; padding:10px; border:1px solid #222; border-radius:10px; background:#0d0d0d; color:#cfcfcf; font-size:14px; line-height:1.4; overflow-wrap:anywhere; word-break:break-word;">
 			<div style="font-weight:600; margin-bottom:6px;">Feature Notes</div>
 			<ul style="margin:0; padding-left:18px;">
-				${hasParam("quantization") ? `<li><code>quantization</code>: BitsAndBytes VRAM reduction (<code>bnb-8bit</code>/<code>bnb-4bit</code>) requires a CUDA GPU + <code>bitsandbytes</code>. Use <code>none</code> if unsupported.</li>` : ""}
+				${hasParam("device") ? `<li><code>device</code>: <code>default</code> follows ComfyUI's active device; <code>cpu</code> forces CPU; <code>gpu:N</code> selects a host GPU option when available.</li>` : ""}
+				${hasParam("quantization") ? `<li><code>quantization</code>: BitsAndBytes VRAM reduction (<code>bnb-8bit</code>/<code>bnb-4bit</code>) requires a CUDA GPU + optional <code>bitsandbytes</code>. Use <code>none</code> if unsupported.</li>` : ""}
 				${hasParam("chinese_conversion_only") ? `<li><code>chinese_conversion_only</code>: OpenCC Simplified↔Traditional conversion without loading the model (text-only).</li>` : ""}
 				${hasParam("long_text_strategy") ? `<li><code>long_text_strategy</code>: Use <code>auto-continue</code> or <code>segmented</code> for long documents to reduce early-stop cases.</li>` : ""}
 				<li>If model downloads are slow/unreliable, you can manually copy the model snapshot into your ComfyUI models folder and restart (see README for exact folder structure).</li>
@@ -158,7 +172,14 @@ function showHelpModal(nodeData) {
 app.registerExtension({
 	name: EXT_NAME,
 	async beforeRegisterNodeDef(nodeType, nodeData, app) {
-		if (nodeData?.name !== "TranslateGemma") return;
+		if (!isTranslateGemmaNode(nodeData)) return;
+		if (!nodeType?.prototype || nodeType.prototype[PATCH_FLAG]) return;
+		Object.defineProperty(nodeType.prototype, PATCH_FLAG, {
+			value: true,
+			configurable: false,
+			enumerable: false,
+			writable: false,
+		});
 
 		// Pad computed width slightly so the title-bar '?' doesn't overlap title text.
 		const originalComputeSize = nodeType.prototype.computeSize;
