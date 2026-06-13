@@ -1,0 +1,74 @@
+{
+  "id": "translategemma-chinese-conversion-only",
+  "revision": 0,
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TranslateGemma",
+      "pos": [120, 120],
+      "size": [520, 760],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "text", "type": "STRING", "widget": { "name": "text" }, "link": null },
+        { "name": "target_language", "type": "COMBO", "widget": { "name": "target_language" }, "link": null },
+        { "name": "model_size", "type": "COMBO", "widget": { "name": "model_size" }, "link": null },
+        { "name": "device", "type": "COMBO", "widget": { "name": "device" }, "link": null },
+        { "name": "image", "type": "IMAGE", "link": null },
+        { "name": "image_enhance", "type": "BOOLEAN", "widget": { "name": "image_enhance" }, "link": null },
+        { "name": "image_resize_mode", "type": "COMBO", "widget": { "name": "image_resize_mode" }, "link": null },
+        { "name": "image_two_pass", "type": "BOOLEAN", "widget": { "name": "image_two_pass" }, "link": null },
+        { "name": "source_language", "type": "COMBO", "widget": { "name": "source_language" }, "link": null },
+        { "name": "external_text", "type": "STRING", "link": null },
+        { "name": "prompt_mode", "type": "COMBO", "widget": { "name": "prompt_mode" }, "link": null },
+        { "name": "max_new_tokens", "type": "INT", "widget": { "name": "max_new_tokens" }, "link": null },
+        { "name": "max_input_tokens", "type": "INT", "widget": { "name": "max_input_tokens" }, "link": null },
+        { "name": "truncate_input", "type": "BOOLEAN", "widget": { "name": "truncate_input" }, "link": null },
+        { "name": "strict_context_limit", "type": "BOOLEAN", "widget": { "name": "strict_context_limit" }, "link": null },
+        { "name": "keep_model_loaded", "type": "BOOLEAN", "widget": { "name": "keep_model_loaded" }, "link": null },
+        { "name": "debug", "type": "BOOLEAN", "widget": { "name": "debug" }, "link": null },
+        { "name": "chinese_conversion_only", "type": "BOOLEAN", "widget": { "name": "chinese_conversion_only" }, "link": null },
+        { "name": "chinese_conversion_direction", "type": "COMBO", "widget": { "name": "chinese_conversion_direction" }, "link": null },
+        { "name": "long_text_strategy", "type": "COMBO", "widget": { "name": "long_text_strategy" }, "link": null },
+        { "name": "quantization", "type": "COMBO", "widget": { "name": "quantization" }, "link": null }
+      ],
+      "outputs": [
+        { "name": "translated_text", "type": "STRING", "links": null }
+      ],
+      "properties": {
+        "Node name for S&R": "TranslateGemma"
+      },
+      "widgets_values": [
+        "这个范例只进行中文繁简转换，不会载入翻译模型。",
+        "Chinese (Traditional)",
+        "4B",
+        "default",
+        false,
+        "letterbox",
+        true,
+        "Auto Detect",
+        "auto",
+        512,
+        2048,
+        true,
+        true,
+        false,
+        false,
+        true,
+        "to_traditional",
+        "disable",
+        "none"
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "description": "Chinese Simplified/Traditional conversion-only example."
+  },
+  "version": 0.4
+}

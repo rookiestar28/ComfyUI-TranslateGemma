@@ -213,6 +213,16 @@ Category: `text/translation`
 |------|------|-------------|
 | `translated_text` | STRING | Translated text |
 
+## Example Workflows
+
+Import examples from [`example_workflows/`](example_workflows/):
+
+- [`basic_text_translation.json`](example_workflows/basic_text_translation.json): simple text translation.
+- [`external_text_override_template.json`](example_workflows/external_text_override_template.json): template for connecting an upstream `STRING` to `external_text`.
+- [`chinese_conversion_only.json`](example_workflows/chinese_conversion_only.json): OpenCC Simplified/Traditional conversion without model loading.
+- [`image_translation_explicit_source.json`](example_workflows/image_translation_explicit_source.json): image translation template; connect an `IMAGE` input and keep `source_language` explicit.
+- [`long_text_segmented.json`](example_workflows/long_text_segmented.json): paragraph-by-paragraph long text translation.
+
 ## Usage Notes
 
 ### Text: Auto Detect
