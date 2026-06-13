@@ -13,6 +13,7 @@ Reference: 260117-BUNDLE-B_PLAN.md
 import os
 import gc
 import threading
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 import torch
 from transformers import AutoTokenizer
@@ -36,10 +37,16 @@ _MODEL_CACHE_LOCK = threading.RLock()
 # Single-model cache (TG-004: only one model in memory at a time)
 # TG-014: Cache key now includes quantization and revision for correct reload
 _current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
-_current_model_key: Optional[tuple[str, str, Optional[str]]] = None  # (model_size, quantization, revision)
+_current_model_key: Optional[tuple[str, str, Optional[str], str]] = None  # (model_size, quantization, revision, device_key)
 
 # TG-014: Valid quantization options
 QUANTIZATION_OPTIONS = ("none", "bnb-8bit", "bnb-4bit")
+
+# TG-015: Host-aligned device override options.
+DEVICE_OPTION_DEFAULT = "default"
+DEVICE_OPTION_CPU = "cpu"
+DEVICE_OPTION_PREFIX_GPU = "gpu:"
+_FALLBACK_DEVICE_OPTIONS = (DEVICE_OPTION_DEFAULT, DEVICE_OPTION_CPU)
 
 
 def _is_remote_code_allowed(repo_id: str = None) -> tuple[bool, str]:
@@ -116,13 +123,219 @@ def get_model_path(repo_id: str) -> str:
     return model_dir
 
 
-def get_device() -> str:
-    """Determine the best available device."""
+def _get_comfy_model_management():
+    """Return ComfyUI model_management when available."""
+    try:
+        import comfy.model_management as model_management
+
+        return model_management
+    except Exception:
+        return None
+
+
+def _normalize_device_override(device_override: str | None) -> str:
+    option = DEVICE_OPTION_DEFAULT if device_override is None else str(device_override).strip()
+    if option in {"", "auto"}:
+        return DEVICE_OPTION_DEFAULT
+    return option
+
+
+def _device_to_string(device) -> str:
+    if device is None:
+        return _legacy_default_device()
+    return str(device)
+
+
+def _legacy_default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _legacy_device_count() -> int:
+    try:
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 1 if torch.cuda.is_available() else 0
+
+
+def get_device_options() -> tuple[str, ...]:
+    """Return host-aligned device override options for the node widget (TG-015)."""
+    model_management = _get_comfy_model_management()
+    if model_management is not None and hasattr(model_management, "get_gpu_device_options"):
+        try:
+            options = list(model_management.get_gpu_device_options())
+            if DEVICE_OPTION_DEFAULT not in options:
+                options.insert(0, DEVICE_OPTION_DEFAULT)
+            if DEVICE_OPTION_CPU not in options:
+                options.insert(1, DEVICE_OPTION_CPU)
+            return tuple(str(option) for option in options)
+        except Exception:
+            pass
+
+    options = [DEVICE_OPTION_DEFAULT, DEVICE_OPTION_CPU]
+    if torch.cuda.is_available():
+        count = _legacy_device_count()
+        if count > 1:
+            options.extend(f"{DEVICE_OPTION_PREFIX_GPU}{i}" for i in range(count))
+    return tuple(options)
+
+
+def resolve_device_override(device_override: str | None = DEVICE_OPTION_DEFAULT) -> dict[str, str | None]:
+    """
+    Resolve a node device override to a concrete torch device string (TG-015).
+
+    Returns a small dict to keep the public surface stable while still exposing
+    enough context for cache keys, logs, tests, and error messages.
+    """
+    requested = _normalize_device_override(device_override)
+    model_management = _get_comfy_model_management()
+
+    if model_management is not None:
+        try:
+            available = tuple(str(option) for option in model_management.get_gpu_device_options())
+        except Exception:
+            available = ()
+
+        try:
+            if requested == DEVICE_OPTION_DEFAULT:
+                resolved = model_management.get_torch_device()
+                device = _device_to_string(resolved)
+                return {
+                    "requested": requested,
+                    "effective": DEVICE_OPTION_DEFAULT,
+                    "device": device,
+                    "cache_key": f"{DEVICE_OPTION_DEFAULT}:{device}",
+                    "source": "comfy",
+                    "warning": None,
+                }
+
+            resolved = None
+            if hasattr(model_management, "resolve_gpu_device_option"):
+                resolved = model_management.resolve_gpu_device_option(requested)
+            if resolved is not None:
+                device = _device_to_string(resolved)
+                return {
+                    "requested": requested,
+                    "effective": requested,
+                    "device": device,
+                    "cache_key": f"{requested}:{device}",
+                    "source": "comfy",
+                    "warning": None,
+                }
+
+            default_device = _device_to_string(model_management.get_torch_device())
+            available_msg = f" Available options: {', '.join(available)}." if available else ""
+            return {
+                "requested": requested,
+                "effective": DEVICE_OPTION_DEFAULT,
+                "device": default_device,
+                "cache_key": f"{DEVICE_OPTION_DEFAULT}:{default_device}",
+                "source": "comfy",
+                "warning": f"Unsupported device override '{requested}'. Falling back to default.{available_msg}",
+            }
+        except Exception as e:
+            fallback = _legacy_default_device()
+            return {
+                "requested": requested,
+                "effective": DEVICE_OPTION_DEFAULT,
+                "device": fallback,
+                "cache_key": f"{DEVICE_OPTION_DEFAULT}:{fallback}",
+                "source": "legacy",
+                "warning": f"ComfyUI device helper failed ({type(e).__name__}); falling back to {fallback}.",
+            }
+
+    if requested == DEVICE_OPTION_CPU:
+        device = "cpu"
+        return {
+            "requested": requested,
+            "effective": requested,
+            "device": device,
+            "cache_key": f"{requested}:{device}",
+            "source": "legacy",
+            "warning": None,
+        }
+
+    if requested.startswith(DEVICE_OPTION_PREFIX_GPU) and torch.cuda.is_available():
+        try:
+            index = int(requested[len(DEVICE_OPTION_PREFIX_GPU):])
+        except ValueError:
+            index = -1
+        if 0 <= index < _legacy_device_count():
+            device = f"cuda:{index}"
+            return {
+                "requested": requested,
+                "effective": requested,
+                "device": device,
+                "cache_key": f"{requested}:{device}",
+                "source": "legacy",
+                "warning": None,
+            }
+
+    default_device = _legacy_default_device()
+    warning = None
+    if requested != DEVICE_OPTION_DEFAULT:
+        warning = f"Unsupported device override '{requested}'. Falling back to default."
+    return {
+        "requested": requested,
+        "effective": DEVICE_OPTION_DEFAULT,
+        "device": default_device,
+        "cache_key": f"{DEVICE_OPTION_DEFAULT}:{default_device}",
+        "source": "legacy",
+        "warning": warning,
+    }
+
+
+def get_device(device_override: str | None = DEVICE_OPTION_DEFAULT) -> str:
+    """Determine the active device, optionally honoring a host-aligned override."""
+    return str(resolve_device_override(device_override)["device"])
+
+
+@contextmanager
+def _legacy_cuda_device_context(device: str):
+    previous = None
+    if device.startswith("cuda:") and torch.cuda.is_available():
+        try:
+            requested = _parse_cuda_device_index(device)
+            previous = torch.cuda.current_device()
+            if previous != requested:
+                torch.cuda.set_device(requested)
+            else:
+                previous = None
+        except Exception:
+            previous = None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            try:
+                torch.cuda.set_device(previous)
+            except Exception:
+                pass
+
+
+def get_cuda_device_context(device: str):
+    """Return ComfyUI's CUDA device context when available, otherwise a local fallback."""
+    if not str(device).startswith("cuda"):
+        return nullcontext()
+
+    model_management = _get_comfy_model_management()
+    if model_management is not None and hasattr(model_management, "cuda_device_context"):
+        try:
+            return model_management.cuda_device_context(torch.device(device))
+        except Exception:
+            pass
+    return _legacy_cuda_device_context(str(device))
+
+
+def _build_model_device_map(device: str, effective_device_option: str):
+    if not str(device).startswith("cuda"):
+        return None
+    if effective_device_option == DEVICE_OPTION_DEFAULT:
+        return "auto"
+    return {"": str(device)}
 
 
 def cuda_supports_bf16(device_index: int = None) -> bool:
@@ -601,7 +814,11 @@ def unload_current_model():
             if model_key:
                 model_size = model_key[0]
                 quantization = model_key[1] if len(model_key) > 1 else "none"
-                print(f"[TranslateGemma] {model_size} model (quantization={quantization}) unloaded, memory cleaned")
+                device_key = model_key[3] if len(model_key) > 3 else "unknown"
+                print(
+                    f"[TranslateGemma] {model_size} model "
+                    f"(quantization={quantization}, device={device_key}) unloaded, memory cleaned"
+                )
             else:
                 print("[TranslateGemma] Model unloaded, memory cleaned")
 
@@ -642,6 +859,8 @@ def _build_load_context(
     dtype,
     cache_dir: str,
     revision: str = None,
+    device_override: str = DEVICE_OPTION_DEFAULT,
+    effective_device_option: str = DEVICE_OPTION_DEFAULT,
 ) -> str:
     """
     Build context string for error messages (TG-008).
@@ -654,6 +873,8 @@ def _build_load_context(
         f"device: {device}",
         f"dtype: {dtype}",
         f"cache_dir: {cache_dir}",
+        f"device_override: {device_override}",
+        f"effective_device_option: {effective_device_option}",
     ]
     if revision:
         lines.append(f"revision: {revision}")
@@ -795,6 +1016,7 @@ def load_model(
     model_size: str,
     revision: Optional[str] = None,
     quantization: str = "none",
+    device_override: str = DEVICE_OPTION_DEFAULT,
 ) -> tuple:
     """
     Load TranslateGemma model and tokenizer with single-model cache (TG-004).
@@ -803,6 +1025,7 @@ def load_model(
         model_size: One of "4B", "12B", "27B"
         revision: Optional HuggingFace revision/commit hash for reproducibility (TG-006)
         quantization: Quantization mode (TG-014): "none", "bnb-8bit", or "bnb-4bit"
+        device_override: Device override (TG-015): "default", "cpu", or "gpu:N"
 
     Returns:
         Tuple of (model, processor)
@@ -813,38 +1036,58 @@ def load_model(
     if quantization not in QUANTIZATION_OPTIONS:
         raise ValueError(f"Invalid quantization mode: {quantization}. Choose from: {QUANTIZATION_OPTIONS}")
 
+    device_selection = resolve_device_override(device_override)
+    resolved_device = str(device_selection["device"])
+    resolved_device_key = str(device_selection["cache_key"])
+    effective_device_option = str(device_selection["effective"])
+    requested_device_option = str(device_selection["requested"])
+
     # Check env var for revision override
     env_revision = os.environ.get("TRANSLATEGEMMA_REVISION")
     if env_revision and not revision:
         revision = env_revision
 
-    # TG-014: Build cache key tuple
-    model_key = (model_size, quantization, revision)
+    # TG-015: Include device in the cache key so CPU/GPU override switches cannot reuse
+    # a model loaded on the wrong device.
+    model_key = (model_size, quantization, revision, resolved_device_key)
 
     # TG-029: Thread-safe cache check and switch
     with _MODEL_CACHE_LOCK:
         # Return cached model if same key is requested (TG-014: includes quantization)
         if _current_model is not None and _current_model_key == model_key:
-            print(f"[TranslateGemma] Using cached {model_size} model (quantization={quantization})")
+            print(
+                f"[TranslateGemma] Using cached {model_size} model "
+                f"(quantization={quantization}, device={resolved_device})"
+            )
             return _current_model
 
         # Unload current model before loading new one (single-model cache)
         if _current_model is not None:
             old_size = _current_model_key[0] if _current_model_key else "unknown"
             old_quant = _current_model_key[1] if _current_model_key and len(_current_model_key) > 1 else "none"
-            print(f"[TranslateGemma] Switching from {old_size} (quantization={old_quant}) to {model_size} (quantization={quantization})")
+            old_device = _current_model_key[3] if _current_model_key and len(_current_model_key) > 3 else "unknown"
+            print(
+                f"[TranslateGemma] Switching from {old_size} "
+                f"(quantization={old_quant}, device={old_device}) to {model_size} "
+                f"(quantization={quantization}, device={resolved_device_key})"
+            )
         unload_current_model()
 
     repo_id = MODEL_REPOS.get(model_size)
     if not repo_id:
         raise ValueError(f"Invalid model size: {model_size}. Choose from: {list(MODEL_REPOS.keys())}")
 
-    device = get_device()
+    device = resolved_device
     cache_dir = get_model_path(repo_id)  # TG-005: isolated per repo
     dtype = get_torch_dtype(device)
 
     print(f"[TranslateGemma] Loading {model_size} model from {repo_id}...")
-    print(f"[TranslateGemma] Device: {device}, dtype: {dtype}, quantization: {quantization}")
+    if device_selection.get("warning"):
+        print(f"[TranslateGemma] WARNING: {device_selection['warning']}")
+    print(
+        f"[TranslateGemma] Device: {device}, dtype: {dtype}, quantization: {quantization}, "
+        f"device_override={requested_device_option}, effective_device={effective_device_option}"
+    )
     print(f"[TranslateGemma] Cache dir: {cache_dir}")
     if revision:
         print(f"[TranslateGemma] Revision: {revision}")
@@ -917,7 +1160,7 @@ def load_model(
             revision=revision,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-            device_map="auto" if device.startswith("cuda") else None,
+            device_map=_build_model_device_map(device, effective_device_option),
             trust_remote_code=False,
             use_safetensors=True,
         )
@@ -925,10 +1168,11 @@ def load_model(
             model_kwargs["quantization_config"] = quantization_config
 
         try:
-            model = AutoModelForImageTextToText.from_pretrained(
-                load_source,
-                **model_kwargs,
-            )
+            with get_cuda_device_context(device):
+                model = AutoModelForImageTextToText.from_pretrained(
+                    load_source,
+                    **model_kwargs,
+                )
         except Exception as e:
             if "safetensors" in str(e).lower():
                 print("[TranslateGemma] safetensors not available, falling back to .bin")
@@ -942,10 +1186,11 @@ def load_model(
             print(f"[TranslateGemma] Loading model with trust_remote_code=True (policy: {policy_reason})")
             model_kwargs["trust_remote_code"] = True
             model_kwargs.pop("use_safetensors", None)  # Remove safetensors preference for fallback
-            model = AutoModelForImageTextToText.from_pretrained(
-                load_source,
-                **model_kwargs,
-            )
+            with get_cuda_device_context(device):
+                model = AutoModelForImageTextToText.from_pretrained(
+                    load_source,
+                    **model_kwargs,
+                )
 
         # TG-014: Do not call model.to(device) for quantized models (already device-mapped)
         if not device.startswith("cuda") and quantization == "none":
@@ -960,7 +1205,10 @@ def load_model(
             _current_model = (model, processor)
             _current_model_key = model_key
 
-        print(f"[TranslateGemma] {model_size} model loaded successfully on {device} (eval mode, quantization={quantization})")
+        print(
+            f"[TranslateGemma] {model_size} model loaded successfully on {device} "
+            f"(eval mode, quantization={quantization}, device_override={requested_device_option})"
+        )
         return model, processor
 
     except Exception as e:
@@ -972,7 +1220,16 @@ def load_model(
             _raise_auth_error(repo_id, e)
 
         # TG-008: Include context in error message
-        context = _build_load_context(model_size, repo_id, device, dtype, cache_dir, revision)
+        context = _build_load_context(
+            model_size,
+            repo_id,
+            device,
+            dtype,
+            cache_dir,
+            revision,
+            device_override=requested_device_option,
+            effective_device_option=effective_device_option,
+        )
         context += f" | quantization: {quantization}"
         raise RuntimeError(f"Failed to load TranslateGemma: {e}\n[Context] {context}") from e
 

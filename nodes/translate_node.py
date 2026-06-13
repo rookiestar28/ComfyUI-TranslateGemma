@@ -14,7 +14,7 @@ from ..utils.chinese_postedit import postedit_traditional_chinese
 from ..utils.chinese_convert import convert_chinese_variants, is_chinese_variant_code, infer_chinese_variant
 from ..utils.model_loader import (
     load_model, get_available_models, unload_current_model,
-    cleanup_torch_memory, get_device, get_torch_dtype, get_model_path, MODEL_REPOS,
+    cleanup_torch_memory, get_device, get_device_options, get_torch_dtype, get_model_path, MODEL_REPOS,
     QUANTIZATION_OPTIONS,  # TG-014
 )
 from ..utils.prompt_builder import (
@@ -276,6 +276,9 @@ class TranslateGemmaNode:
     def INPUT_TYPES(cls):
         languages = get_language_names()
         model_sizes = get_available_models()
+        device_options = list(get_device_options())
+        if "default" not in device_options:
+            device_options.insert(0, "default")
         prompt_modes = PromptMode.get_values()
         
         return {
@@ -293,6 +296,14 @@ class TranslateGemmaNode:
                 "model_size": (model_sizes, {
                     "default": "4B",
                     "tooltip": "Model size: 4B (fastest) / 12B / 27B trade-off (speed vs quality vs VRAM). Gated HF repos require accepting Gemma terms + authentication (`hf auth login` or HF token env var).",
+                }),
+                "device": (device_options, {
+                    "default": "default",
+                    "tooltip": (
+                        "Device override (TG-015). default: use ComfyUI's active device. "
+                        "cpu: force CPU. gpu:N: use the Nth host GPU option when available. "
+                        "Invalid saved values fall back to default."
+                    ),
                 }),
             },
             "optional": {
@@ -411,6 +422,7 @@ class TranslateGemmaNode:
         text: Any,
         target_language: Any,
         model_size: Any,
+        device: Any = "default",  # TG-015
         image=None,
         image_enhance: Any = False,
         image_resize_mode: Any = "letterbox",
@@ -433,6 +445,7 @@ class TranslateGemmaNode:
             text,
             target_language,
             model_size,
+            device,
             image,
             image_enhance,
             image_resize_mode,
@@ -463,6 +476,9 @@ class TranslateGemmaNode:
 
             one_model_size = self._slice_or_default(model_size, i, "4B")
             one_model_size = "4B" if one_model_size is None else str(one_model_size)
+
+            raw_device = self._slice_or_default(device, i, "default")
+            one_device = "default" if raw_device is None else str(raw_device)
 
             one_image = self._slice_or_default(image, i, None)
 
@@ -530,6 +546,7 @@ class TranslateGemmaNode:
                 text=one_text,
                 target_language=one_target_language,
                 model_size=one_model_size,
+                device=one_device,
                 image=one_image,
                 image_enhance=one_image_enhance,
                 image_resize_mode=one_image_resize_mode,
@@ -557,6 +574,7 @@ class TranslateGemmaNode:
         text: str,
         target_language: str,
         model_size: str,
+        device: str = "default",  # TG-015
         image=None,
         image_enhance: bool = False,
         image_resize_mode: str = "letterbox",
@@ -584,6 +602,7 @@ class TranslateGemmaNode:
             text: Text from the built-in input field
             target_language: Target language name
             model_size: Model size (4B, 12B, 27B)
+            device: Device override (default/cpu/gpu:N)
             image: Optional image input (TG-025)
             image_enhance: Apply enhancement for small text in images (TG-025)
             image_resize_mode: Image preprocessing mode (TG-025)
@@ -619,6 +638,7 @@ class TranslateGemmaNode:
                 image=image,
                 target_language=target_language,
                 model_size=model_size,
+                device=device,
                 source_language=source_language,
                 image_enhance=image_enhance,
                 image_resize_mode=image_resize_mode,
@@ -645,6 +665,7 @@ class TranslateGemmaNode:
                 target_language=target_language,
                 source_language=source_language,
                 model_size=model_size,
+                device=device,
                 prompt_mode=prompt_mode,
                 max_new_tokens=max_new_tokens,
                 max_input_tokens=max_input_tokens,
@@ -681,7 +702,7 @@ class TranslateGemmaNode:
         # Load model and processor/tokenizer
         # TG-014: Pass quantization to load_model
         t_load_start = time.time()
-        model, processor = load_model(model_size, quantization=quantization)
+        model, processor = load_model(model_size, quantization=quantization, device_override=device)
         t_load_s = time.time() - t_load_start
         tokenizer = getattr(processor, "tokenizer", processor)
 
@@ -709,8 +730,8 @@ class TranslateGemmaNode:
 
         # Preferred compute dtype for floating inputs (pixel values, embeddings, etc).
         # Keep consistent with utils/model_loader.py selection.
-        device = get_device()
-        dtype = get_torch_dtype(device)
+        resolved_device = get_device(device)
+        dtype = get_torch_dtype(resolved_device)
 
         # TG-041: Log runtime capabilities once per process
         runtime_caps = log_runtime_capabilities_once(processor, tokenizer, debug=debug)
@@ -729,6 +750,7 @@ class TranslateGemmaNode:
                 "[TranslateGemma] Runtime info: "
                 f"torch={getattr(torch, '__version__', 'unknown')}, "
                 f"cuda_available={cuda_available}, cuda_device={cuda_name}, "
+                f"device_override={device}, resolved_device={resolved_device}, "
                 f"model_input_device={input_device}, "
                 f"hf_device_map={'present' if hf_device_map else 'none'}, "
                 f"dtype={dtype}, load_time_s={t_load_s:.2f}"
@@ -981,7 +1003,8 @@ class TranslateGemmaNode:
         cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
         inference_context = (
             f"model_size: {model_size} | repo_id: {repo_id} | "
-            f"device: {device} | dtype: {dtype} | cache_dir: {cache_dir} | "
+            f"device_override: {device} | resolved_device: {resolved_device} | "
+            f"dtype: {dtype} | cache_dir: {cache_dir} | "
             f"user_max_new_tokens: {max_new_tokens} | "
             f"requested_max_new_tokens: {requested_max_new_tokens} | "
             f"effective_max_new_tokens: {limits['effective_max_new_tokens']} | "
@@ -1085,6 +1108,7 @@ class TranslateGemmaNode:
                             text=text,
                             target_language=target_language,
                             model_size=model_size,
+                            device=device,
                             image=image,
                             image_enhance=image_enhance,
                             image_resize_mode=image_resize_mode,
@@ -1113,6 +1137,7 @@ class TranslateGemmaNode:
                         text=text,
                         target_language=target_language,
                         model_size=model_size,
+                        device=device,
                         image=image,
                         image_enhance=image_enhance,
                         image_resize_mode=image_resize_mode,
@@ -1163,6 +1188,7 @@ class TranslateGemmaNode:
                     target_language=target_language,
                     source_language=source_language,
                     model_size=model_size,
+                    device=device,
                     prompt_mode=prompt_mode,
                     max_new_tokens=max_new_tokens,
                     max_input_tokens=max_input_tokens,
@@ -1200,6 +1226,7 @@ class TranslateGemmaNode:
         strict_context_limit: bool,
         keep_model_loaded: bool,
         debug: bool,
+        device: str = "default",  # TG-015
         quantization: str = "none",  # TG-014
         _eot_relaxed_retry: bool = False,
     ) -> tuple[str]:
@@ -1222,7 +1249,7 @@ class TranslateGemmaNode:
 
         # TG-014: Pass quantization to load_model
         t_load_start = time.time()
-        model, processor = load_model(model_size, quantization=quantization)
+        model, processor = load_model(model_size, quantization=quantization, device_override=device)
         t_load_s = time.time() - t_load_start
         tokenizer = getattr(processor, "tokenizer", processor)
 
@@ -1242,6 +1269,7 @@ class TranslateGemmaNode:
             print(
                 "[TranslateGemma] Image runtime info: "
                 f"cuda_available={cuda_available}, cuda_device={cuda_name}, "
+                f"device_override={device}, resolved_device={get_device(device)}, "
                 f"model_input_device={input_device}, load_time_s={t_load_s:.2f}"
             )
 
@@ -1307,12 +1335,13 @@ class TranslateGemmaNode:
         )
 
         repo_id = MODEL_REPOS.get(model_size) or "unknown"
-        device = get_device()
-        dtype = get_torch_dtype(device)
+        resolved_device = get_device(device)
+        dtype = get_torch_dtype(resolved_device)
         cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
         inference_context = (
             f"mode: image | model_size: {model_size} | repo_id: {repo_id} | "
-            f"device: {device} | dtype: {dtype} | cache_dir: {cache_dir} | "
+            f"device_override: {device} | resolved_device: {resolved_device} | "
+            f"dtype: {dtype} | cache_dir: {cache_dir} | "
             f"user_max_new_tokens: {max_new_tokens} | max_input_tokens: {max_input_tokens} | "
             f"effective_max_input_tokens: {effective_max_input_tokens} | "
             f"truncate: {truncate_input} | strict_limit: {strict_context_limit} | "
@@ -1565,6 +1594,7 @@ class TranslateGemmaNode:
                         image=image,
                         target_language=target_language,
                         model_size=model_size,
+                        device=device,
                         source_language=source_language,
                         image_enhance=image_enhance,
                         image_resize_mode=image_resize_mode,
@@ -1597,6 +1627,7 @@ class TranslateGemmaNode:
                     text=image_result,
                     target_language=target_language,
                     model_size=model_size,
+                    device=device,
                     image=None,
                     image_enhance=False,
                     image_resize_mode="letterbox",
@@ -1828,6 +1859,7 @@ class TranslateGemmaNode:
         keep_model_loaded: bool,
         debug: bool,
         actual_input_tokens: int,
+        device: str = "default",  # TG-015
         quantization: str = "none",  # TG-014
     ) -> str:
         """
@@ -1873,6 +1905,7 @@ class TranslateGemmaNode:
                     text=continuation_instruction,
                     target_language=target_language,
                     model_size=model_size,
+                    device=device,
                     source_language=source_language,
                     prompt_mode="plain",  # Use plain for continuation prompts
                     max_new_tokens=max_new_tokens,
@@ -1952,6 +1985,7 @@ class TranslateGemmaNode:
         strict_context_limit: bool,
         keep_model_loaded: bool,
         debug: bool,
+        device: str = "default",  # TG-015
         quantization: str = "none",  # TG-014
     ) -> str:
         """
@@ -1990,6 +2024,7 @@ class TranslateGemmaNode:
                     text=part,
                     target_language=target_language,
                     model_size=model_size,
+                    device=device,
                     source_language=source_language,
                     prompt_mode=prompt_mode,
                     max_new_tokens=max_new_tokens,

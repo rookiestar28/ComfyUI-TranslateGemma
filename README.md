@@ -194,6 +194,7 @@ Category: `text/translation`
 | `target_language` | COMBO | Translation target language. Does not affect `chinese_conversion_only=true`. |
 | `source_language` | COMBO | Auto Detect is supported for text only. Images require explicit source language. Default: Auto Detect. |
 | `model_size` | COMBO | 4B (fastest) / 12B / 27B trade-off (speed vs quality vs VRAM). Gated repos require HF authentication. See VRAM Notes below for rough estimates. |
+| `device` | COMBO | Device override. `default` uses ComfyUI's active device; `cpu` forces CPU; `gpu:N` selects the Nth host GPU option when available. Invalid saved values fall back to `default`. |
 | `prompt_mode` | COMBO | `auto` (structured first, fallback to plain) / `structured` (fail if unavailable) / `plain` (instruction only). Default: `auto`. |
 | `max_new_tokens` | INT | Maximum output tokens. `0` = Auto (based on input length and remaining context budget). Also clamped by the model context window. Default: 512. |
 | `max_input_tokens` | INT | Input truncation limit. `0` = Auto (reserve room for output within context). Too low can break multimodal inputs/templates. Default: 2048. |
@@ -359,6 +360,7 @@ The following are the authoritative default values for node inputs:
 | Setting | Default | Notes |
 |---------|---------|-------|
 | `model_size` | `4B` | Smallest, fastest |
+| `device` | `default` | Use ComfyUI's active device |
 | `max_new_tokens` | `512` | Use `0` for auto-sizing |
 | `max_input_tokens` | `2048` | Input truncation limit (`0` = Auto) |
 | `keep_model_loaded` | `true` | Avoids reload overhead |
