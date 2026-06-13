@@ -1,0 +1,4 @@
+# Optional dependency for `quantization=bnb-8bit` / `quantization=bnb-4bit`.
+# Base installs intentionally exclude bitsandbytes so CPU, Mac, AMD, and
+# ComfyUI Desktop environments can load the node with `quantization=none`.
+bitsandbytes

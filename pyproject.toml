@@ -28,6 +28,11 @@ dependencies = [
     "opencc-python-reimplemented",
 ]
 
+[project.optional-dependencies]
+quantization = [
+    "bitsandbytes",
+]
+
 [project.urls]
 Repository = "https://github.com/rookiestar28/ComfyUI-TranslateGemma"
 #  Used by Comfy Registry https://registry.comfy.org
@@ -44,6 +49,7 @@ includes = [
     "utils/**",
     "web/**",
     "requirements.txt",
+    "requirements-quantization.txt",
     "README.md",
     "LICENSE",
 ]

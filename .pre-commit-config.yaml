@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets
+        entry: detect-secrets-hook --no-verify
+        language: python
+        additional_dependencies:
+          - detect-secrets==1.5.0
+        types:
+          - text

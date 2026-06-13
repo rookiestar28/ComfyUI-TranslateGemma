@@ -727,14 +727,16 @@ def _check_bnb_availability(quantization: str, device: str) -> None:
             "- Set quantization=none to load the model without quantization"
         )
 
-    # 2. Check bitsandbytes import
+    # IMPORTANT: keep this import inside the BnB-only branch. Base installs and
+    # quantization=none must work without the optional native bitsandbytes package.
     try:
         import bitsandbytes  # noqa: F401
     except ImportError as e:
         raise RuntimeError(
             f"bitsandbytes quantization (quantization={quantization}) requires bitsandbytes to be installed.\n\n"
             "To resolve:\n"
-            "- Install bitsandbytes: pip install bitsandbytes\n"
+            "- Install optional quantization dependencies: pip install -r requirements-quantization.txt\n"
+            "- Or install bitsandbytes into ComfyUI's Python environment: pip install bitsandbytes\n"
             "- Windows users: see https://github.com/jllllll/bitsandbytes-windows-webui for prebuilt wheels\n"
             "- Or set quantization=none to load the model without quantization\n\n"
             f"Import error: {e}"

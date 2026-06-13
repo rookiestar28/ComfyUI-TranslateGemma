@@ -79,7 +79,15 @@ cd ComfyUI-TranslateGemma
 pip install -r requirements.txt
 ```
 
-3) Restart ComfyUI.
+3) Optional, only for `quantization=bnb-8bit` / `quantization=bnb-4bit` on CUDA:
+
+```bash
+pip install -r requirements-quantization.txt
+```
+
+ComfyUI Desktop and portable ComfyUI users must run this with the Python environment used by ComfyUI, not a separate global Python. If optional BitsAndBytes install fails, keep `quantization=none`.
+
+4) Restart ComfyUI.
 
 ## Hugging Face Access (Gated Models)
 
@@ -196,7 +204,7 @@ Category: `text/translation`
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 | `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
-| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes (TG-014). `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). Requires CUDA + bitsandbytes installed. |
+| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes (TG-014). `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). `none` does not require bitsandbytes; BnB modes require CUDA + optional bitsandbytes install. |
 
 ### Outputs
 
@@ -394,8 +402,10 @@ The `quantization` input allows you to load the model in lower precision using [
 ### Requirements
 
 - **CUDA GPU**: bitsandbytes quantization only works on NVIDIA GPUs with CUDA
-- **bitsandbytes installed**: `pip install bitsandbytes`
+- **bitsandbytes installed in the ComfyUI Python environment**: `pip install -r requirements-quantization.txt` or `pip install bitsandbytes`
 - **transformers with BitsAndBytesConfig**: `pip install --upgrade transformers`
+
+`bitsandbytes` is intentionally not included in the base `requirements.txt`. Base installs and `quantization=none` work without it.
 
 ### Troubleshooting
 
@@ -406,7 +416,7 @@ The `quantization` input allows you to load the model in lower precision using [
 
 "bitsandbytes not installed":
 
-- Install: `pip install bitsandbytes`
+- Install into the ComfyUI Python environment: `pip install -r requirements-quantization.txt` or `pip install bitsandbytes`
 - Windows users: see [bitsandbytes-windows-webui](https://github.com/jllllll/bitsandbytes-windows-webui) for prebuilt wheels (third-party, evaluate risk yourself)
 - ComfyUI Desktop users: quantization may require manual bitsandbytes installation; if install fails, use `quantization=none` or run the 4B model
 
