@@ -1,6 +1,6 @@
 # ComfyUI-TranslateGemma
 
-A ComfyUI integration for TranslateGemma — Google's new open source translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and efficient inference from mobile (4B), and local (12B) to cloud (27B).
+A ComfyUI integration for TranslateGemma — Google's open source translation model family built on Gemma 3. It supports 55 languages, multimodal image-to-text translation, and 4B / 12B / 27B model variants for different hardware budgets.
 
 <p align="center">
   <img src="assets/TranslateGemma.png" alt="TranslateGemma" />
@@ -15,8 +15,9 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
 - Added `max_new_tokens=0` / `max_input_tokens=0` as **Auto** token budgeting (context-aware).
 - Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
+- Added `device` override (`default` / `cpu` / `gpu:N`) aligned with ComfyUI device management when available.
 - Added optional BitsAndBytes quantization (`quantization`: `none` / `bnb-8bit` / `bnb-4bit`) for best-effort VRAM reduction.
-- Added a node UI `?` help modal and `0 = auto` labels for max token widgets.
+- Added native ComfyUI node docs, a node UI `?` help modal, `0 = auto` labels for max token widgets, and importable example workflows.
 - Improved Hugging Face download diagnostics (network/auth/disk hints + retries) and added troubleshooting guidance (proxy/mirror/offline).
 
 ---
@@ -26,23 +27,25 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - [Features](#features)
 - [Installation](#installation)
 - [Hugging Face Access (Gated Models)](#hugging-face-access-gated-models)
+- [Download Troubleshooting (Hugging Face)](#download-troubleshooting-hugging-face)
 - [Model Storage Location](#model-storage-location)
   - [Manual / Offline Download (Recommended for Restricted Networks)](#manual--offline-download-recommended-for-restricted-networks)
 - [Node: TranslateGemma](#node-translategemma)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
+- [Example Workflows](#example-workflows)
 - [Usage Notes](#usage-notes)
   - [Text: Auto Detect](#text-auto-detect)
   - [Image Translation Requires Source Language](#image-translation-requires-source-language)
   - [Image Preprocessing (896×896)](#image-preprocessing-896896)
   - [Notes on Chinese Variants](#notes-on-chinese-variants)
-  - [Chinese Conversion-Only Mode (TG-038)](#chinese-conversion-only-mode-tg-038)
-  - [Long Text Strategy (TG-050)](#long-text-strategy-tg-050)
+  - [Chinese Conversion-Only Mode](#chinese-conversion-only-mode)
+  - [Long Text Strategy](#long-text-strategy)
   - [Language Code Normalization](#language-code-normalization)
-- [Default Settings (TG-032)](#default-settings-tg-032)
+- [Default Settings](#default-settings)
 - [Performance Tips](#performance-tips)
 - [VRAM Notes (Native Models)](#vram-notes-native-models)
-- [Quantization (bitsandbytes) — TG-014](#quantization-bitsandbytes--tg-014)
+- [Quantization (bitsandbytes)](#quantization-bitsandbytes)
 - [Security / Reproducibility Notes](#security--reproducibility-notes)
 - [License](#license)
 
@@ -53,7 +56,10 @@ A ComfyUI integration for TranslateGemma — Google's new open source translatio
 - First-run auto download via Hugging Face (requires accepting Gemma terms)
 - Flexible inputs: built-in text box + external string input
 - Optional image input: translate text found in images (multimodal)
-- Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model (TG-038)
+- Host-aligned device override: `default`, `cpu`, or `gpu:N` when available
+- Optional BitsAndBytes quantization as a separate install path
+- Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model
+- Native node docs, in-node help, and example workflows
 
 ## Installation
 
@@ -205,7 +211,7 @@ Category: `text/translation`
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 | `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
-| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes (TG-014). `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). `none` does not require bitsandbytes; BnB modes require CUDA + optional bitsandbytes install. |
+| `quantization` | COMBO | Best-effort VRAM reduction via bitsandbytes. `none` (default) / `bnb-8bit` (~50% VRAM reduction) / `bnb-4bit` (~75% VRAM reduction). `none` does not require bitsandbytes; BnB modes require CUDA + optional bitsandbytes install. |
 
 ### Outputs
 
@@ -243,7 +249,7 @@ For image translation, the node supports multiple preprocessing modes via `image
 - `processor`: rely on the official Gemma3 image processor resize to **896×896** (may stretch)
 - `stretch`: force resize to **896×896** (may distort)
 
-If small text is missed, try enabling `image_enhance=true` to apply mild pixel-only enhancement (TG-037).
+If small text is missed, try enabling `image_enhance=true` to apply mild pixel-only enhancement.
 
 **Enhancement tuning (experimental)**:
 
@@ -282,7 +288,7 @@ If you still see mixed Simplified/Traditional output when targeting Traditional 
 - Default behavior: when `target_language=Chinese (Traditional)` the node will convert Simplified → Traditional if OpenCC is available
 - Disable: set `TRANSLATEGEMMA_TRADITIONAL_POSTEDIT=0`
 
-### Chinese Conversion-Only Mode (TG-038)
+### Chinese Conversion-Only Mode
 
 For workflows that only need **script conversion** (Simplified ↔ Traditional) without translation, enable `chinese_conversion_only=true`. This mode:
 
@@ -316,7 +322,7 @@ For workflows that only need **script conversion** (Simplified ↔ Traditional) 
 - You want to avoid model download/load overhead
 - You need deterministic, reproducible output (no LLM randomness)
 
-### Long Text Strategy (TG-050)
+### Long Text Strategy
 
 For long texts, the model may stop early (emitting `<end_of_turn>`) before completing the translation. The `long_text_strategy` option provides two approaches:
 
@@ -363,7 +369,7 @@ The node accepts both `_` and `-` variants for language codes (e.g., `zh_Hant` a
 
 If an unsupported language is passed, the node prints a warning and defaults to English. Set `TRANSLATEGEMMA_STRICT_LANG=1` to raise an error instead.
 
-## Default Settings (TG-032)
+## Default Settings
 
 The following are the authoritative default values for node inputs:
 
@@ -397,7 +403,7 @@ The following are the authoritative default values for node inputs:
   - 12B model: ~27 GB
   - 27B model: ~56 GB
 
-## Quantization (bitsandbytes) — TG-014
+## Quantization (bitsandbytes)
 
 **Best-effort VRAM reduction** for running larger models (12B/27B) on consumer GPUs.
 
@@ -456,7 +462,7 @@ The `quantization` input allows you to load the model in lower precision using [
 
 ## Security / Reproducibility Notes
 
-### Remote Code Policy (TG-026)
+### Remote Code Policy
 
 - The loader attempts `trust_remote_code=False` first and only falls back to `True` if required.
 - Set `TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0` to deny remote code entirely (fails if code is needed).
@@ -466,7 +472,7 @@ The `quantization` input allows you to load the model in lower precision using [
 
 - You can pin a specific revision for reproducibility via `TRANSLATEGEMMA_REVISION=<commit-or-tag>`.
 
-### Debug Privacy (TG-028)
+### Debug Privacy
 
 - By default, `debug=true` redacts sensitive data (user text content, full filesystem paths).
 - Set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` to enable full diagnostics (for troubleshooting).
