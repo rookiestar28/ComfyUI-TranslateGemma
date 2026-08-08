@@ -26,7 +26,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 
 <summary><strong>Classic, Vue Nodes, and workflow behavior aligned</strong></summary>
 
-- Added host-backed Classic and Vue Nodes checks for native Node Help, labels, and frontend safety.
+- Added host-backed Classic and Vue Nodes checks for native ComfyUI Node Help, labels, and frontend safety.
 - Moved tuning controls behind ComfyUI's native advanced-input UI while preserving essential widgets and linked sockets.
 - Preserved legacy positional workflow values and added named-value compatibility for newer frontend save/restore paths.
 
