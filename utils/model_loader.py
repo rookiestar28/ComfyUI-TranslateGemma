@@ -14,7 +14,8 @@ import os
 import gc
 import threading
 from contextlib import contextmanager, nullcontext
-from typing import Optional
+from functools import wraps
+from typing import Any, Callable, NoReturn, Optional, ParamSpec, TypeVar
 import torch
 from transformers import AutoTokenizer
 try:
@@ -34,6 +35,22 @@ MODEL_REPOS = {
 # TG-029: Thread-safety lock for cache operations
 _MODEL_CACHE_LOCK = threading.RLock()
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def serialized_model_access(function: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Serialize a complete model-cache ownership interval."""
+
+    @wraps(function)
+    def synchronized(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # CRITICAL: keep load through inference/unload under this RLock; narrowing
+        # the interval permits duplicate residency or unload during active inference.
+        with _MODEL_CACHE_LOCK:
+            return function(*args, **kwargs)
+
+    return synchronized
+
 # Single-model cache (TG-004: only one model in memory at a time)
 # TG-014: Cache key now includes quantization and revision for correct reload
 _current_model: Optional[tuple] = None  # (model, processor_or_tokenizer)
@@ -48,37 +65,181 @@ DEVICE_OPTION_CPU = "cpu"
 DEVICE_OPTION_PREFIX_GPU = "gpu:"
 _FALLBACK_DEVICE_OPTIONS = (DEVICE_OPTION_DEFAULT, DEVICE_OPTION_CPU)
 
+_TRUE_POLICY_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_POLICY_VALUES = frozenset({"", "0", "false", "no", "off"})
 
-def _is_remote_code_allowed(repo_id: str = None) -> tuple[bool, str]:
+
+class _SafeModelLoadError(RuntimeError):
+    """A user-facing load failure whose message is safe to expose."""
+
+
+def _read_explicit_opt_in(name: str) -> tuple[bool, str]:
+    """Read a boolean security policy without echoing its potentially sensitive value."""
+    raw_value = os.environ.get(name)
+    normalized = "" if raw_value is None else raw_value.strip().lower()
+    if normalized in _TRUE_POLICY_VALUES:
+        return True, f"{name}=enabled"
+    if normalized in _FALSE_POLICY_VALUES:
+        return False, f"{name}=disabled"
+    return False, f"{name}=invalid (expected 0/1, false/true, no/yes, or off/on)"
+
+
+def _is_remote_code_allowed(repo_id: Optional[str] = None) -> tuple[bool, str]:
     """
     Check if remote code execution is allowed based on policy (TG-026).
     
     Environment variables:
-    - TRANSLATEGEMMA_ALLOW_REMOTE_CODE: "1" (default) to allow, "0" to deny
+    - TRANSLATEGEMMA_ALLOW_REMOTE_CODE: explicit boolean opt-in (default: deny)
     - TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST: comma-separated repo IDs (optional)
     
     Precedence:
-    1) ALLOW_REMOTE_CODE=0 → deny always
-    2) If allowlist set → allow only if repo_id in allowlist
-    3) Else → allow (default)
+    1) Missing, false, or malformed opt-in → deny
+    2) If allowlist is set → require an exact repo_id match
+    3) Otherwise → allow because the explicit opt-in is present
     
     Returns:
         Tuple of (is_allowed, reason_string)
     """
-    allow_env = os.environ.get("TRANSLATEGEMMA_ALLOW_REMOTE_CODE", "1").strip()
-    
-    # Explicit deny
-    if allow_env == "0":
-        return False, "TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0"
-    
-    # Check allowlist if set
+    allowed, reason = _read_explicit_opt_in("TRANSLATEGEMMA_ALLOW_REMOTE_CODE")
+    if not allowed:
+        return False, reason
+
     allowlist_env = os.environ.get("TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST", "").strip()
     if allowlist_env:
-        allowed_repos = [r.strip() for r in allowlist_env.split(",") if r.strip()]
-        if repo_id and repo_id not in allowed_repos:
-            return False, f"repo_id '{repo_id}' not in TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST"
-    
-    return True, "default policy"
+        allowed_repos = {entry.strip() for entry in allowlist_env.split(",") if entry.strip()}
+        if repo_id is None or repo_id not in allowed_repos:
+            return False, "repository is not in TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST"
+        return True, "explicit opt-in and exact allowlist match"
+
+    return True, "explicit opt-in"
+
+
+def _is_unsafe_weights_allowed() -> tuple[bool, str]:
+    """Return the independent opt-in state for non-safetensors model weights."""
+    return _read_explicit_opt_in("TRANSLATEGEMMA_ALLOW_UNSAFE_WEIGHTS")
+
+
+def _is_remote_code_required_error(error: Exception) -> bool:
+    """Classify only errors that explicitly request repository code execution."""
+    message = str(error).casefold()
+    if "trust_remote_code" not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "requires custom",
+            "requires you to execute",
+            "custom repository code",
+            "contains custom code",
+            "must be executed",
+            "must execute",
+            "execute the configuration file",
+        )
+    )
+
+
+def _is_safetensors_unavailable_error(error: Exception) -> bool:
+    """Classify absence of safetensors without treating corruption as format absence."""
+    message = str(error).casefold()
+    if "safetensor" not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "no safetensor",
+            "safetensors not available",
+            "safetensors weights were not found",
+            "does not appear to have a file named",
+            "does not contain safetensor",
+        )
+    )
+
+
+def _raise_safe_stage_failure(stage: str, error: Exception) -> NoReturn:
+    if _detect_auth_error(error):
+        raise _SafeModelLoadError(
+            f"TranslateGemma {stage} loading failed due to authentication or repository access. "
+            "Verify model access and Hugging Face authentication."
+        ) from None
+    raise _SafeModelLoadError(
+        f"TranslateGemma {stage} loading failed. Check network access, disk space, "
+        "model files, and Transformers compatibility."
+    ) from None
+
+
+def _load_pretrained_with_security_policy(
+    loader: Any,
+    load_source: str,
+    load_kwargs: dict[str, Any],
+    *,
+    repo_id: str,
+    revision: Optional[str],
+    stage: str,
+    allow_weight_fallback: bool,
+) -> Any:
+    """Load with explicit, independently authorized permission transitions."""
+    kwargs = dict(load_kwargs)
+    attempted_states = set()
+
+    while True:
+        state = (
+            bool(kwargs.get("trust_remote_code", False)),
+            kwargs.get("use_safetensors"),
+        )
+        if state in attempted_states:
+            raise _SafeModelLoadError(
+                f"TranslateGemma {stage} loading stopped after a repeated security-policy state."
+            )
+        attempted_states.add(state)
+
+        try:
+            return loader.from_pretrained(load_source, **kwargs)
+        except Exception as load_error:
+            # CRITICAL: generic load failures must never authorize executable repository code.
+            if (
+                not kwargs.get("trust_remote_code", False)
+                and _is_remote_code_required_error(load_error)
+            ):
+                remote_allowed, policy_reason = _is_remote_code_allowed(repo_id)
+                if not remote_allowed:
+                    raise _SafeModelLoadError(
+                        f"TranslateGemma {stage} loading requires repository custom code, but "
+                        f"remote code is denied ({policy_reason}). Set "
+                        "TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 and optionally configure the exact "
+                        "repository allowlist."
+                    ) from None
+                kwargs["trust_remote_code"] = True
+                print(
+                    f"[TranslateGemma] Loading {stage} with trust_remote_code=True "
+                    f"(policy: {policy_reason})"
+                )
+                if not revision:
+                    print(
+                        "[TranslateGemma] SECURITY: pin a commit revision when remote code is enabled."
+                    )
+                continue
+
+            # CRITICAL: non-safetensors weights require a separate opt-in from remote code.
+            if (
+                allow_weight_fallback
+                and kwargs.get("use_safetensors") is True
+                and _is_safetensors_unavailable_error(load_error)
+            ):
+                unsafe_allowed, policy_reason = _is_unsafe_weights_allowed()
+                if not unsafe_allowed:
+                    raise _SafeModelLoadError(
+                        "TranslateGemma model loading found no compatible safetensors weights, "
+                        f"but non-safetensors weights are denied ({policy_reason}). Set "
+                        "TRANSLATEGEMMA_ALLOW_UNSAFE_WEIGHTS=1 only after reviewing the model source."
+                    ) from None
+                kwargs["use_safetensors"] = False
+                print(
+                    "[TranslateGemma] SECURITY: loading non-safetensors weights after explicit "
+                    f"opt-in ({policy_reason})."
+                )
+                continue
+
+            _raise_safe_stage_failure(stage, load_error)
 
 
 def get_model_dir() -> str:
@@ -164,9 +325,14 @@ def _legacy_device_count() -> int:
 def get_device_options() -> tuple[str, ...]:
     """Return host-aligned device override options for the node widget (TG-015)."""
     model_management = _get_comfy_model_management()
-    if model_management is not None and hasattr(model_management, "get_gpu_device_options"):
+    option_helper = (
+        getattr(model_management, "get_gpu_device_options", None)
+        if model_management is not None
+        else None
+    )
+    if callable(option_helper):
         try:
-            options = list(model_management.get_gpu_device_options())
+            options = list(option_helper())
             if DEVICE_OPTION_DEFAULT not in options:
                 options.insert(0, DEVICE_OPTION_DEFAULT)
             if DEVICE_OPTION_CPU not in options:
@@ -183,6 +349,49 @@ def get_device_options() -> tuple[str, ...]:
     return tuple(options)
 
 
+def _resolve_default_device(model_management) -> tuple[str, str]:
+    default_helper = (
+        getattr(model_management, "get_torch_device", None)
+        if model_management is not None
+        else None
+    )
+    if callable(default_helper):
+        try:
+            return _device_to_string(default_helper()), "comfy"
+        except Exception:
+            pass
+    return _legacy_default_device(), "legacy"
+
+
+def _device_override_warning(requested: str) -> str:
+    if requested.startswith(DEVICE_OPTION_PREFIX_GPU):
+        return "Unsupported device override: requested GPU device is unavailable; falling back to default."
+    return "Unsupported device override; falling back to default."
+
+
+def _parse_gpu_override_index(requested: str) -> int | None:
+    if not requested.startswith(DEVICE_OPTION_PREFIX_GPU):
+        return None
+    raw_index = requested[len(DEVICE_OPTION_PREFIX_GPU):]
+    if not raw_index.isascii() or not raw_index.isdecimal():
+        return None
+    try:
+        return int(raw_index)
+    except ValueError:
+        return None
+
+
+def _safe_device_option_label(requested: str) -> str:
+    if requested in {DEVICE_OPTION_DEFAULT, DEVICE_OPTION_CPU}:
+        return requested
+    if requested.startswith(DEVICE_OPTION_PREFIX_GPU):
+        gpu_index = _parse_gpu_override_index(requested)
+        if gpu_index is not None:
+            return f"{DEVICE_OPTION_PREFIX_GPU}{gpu_index}"
+        return "gpu:invalid"
+    return "unsupported"
+
+
 def resolve_device_override(device_override: str | None = DEVICE_OPTION_DEFAULT) -> dict[str, str | None]:
     """
     Resolve a node device override to a concrete torch device string (TG-015).
@@ -193,58 +402,39 @@ def resolve_device_override(device_override: str | None = DEVICE_OPTION_DEFAULT)
     requested = _normalize_device_override(device_override)
     model_management = _get_comfy_model_management()
 
-    if model_management is not None:
+    if requested == DEVICE_OPTION_DEFAULT:
+        device, source = _resolve_default_device(model_management)
+        return {
+            "requested": requested,
+            "effective": DEVICE_OPTION_DEFAULT,
+            "device": device,
+            "cache_key": f"{DEVICE_OPTION_DEFAULT}:{device}",
+            "source": source,
+            "warning": None,
+        }
+
+    gpu_index = _parse_gpu_override_index(requested)
+
+    is_supported_shape = requested == DEVICE_OPTION_CPU or gpu_index is not None
+    resolver = (
+        getattr(model_management, "resolve_gpu_device_option", None)
+        if model_management is not None
+        else None
+    )
+    if is_supported_shape and callable(resolver):
         try:
-            available = tuple(str(option) for option in model_management.get_gpu_device_options())
+            resolved = resolver(requested)
         except Exception:
-            available = ()
-
-        try:
-            if requested == DEVICE_OPTION_DEFAULT:
-                resolved = model_management.get_torch_device()
-                device = _device_to_string(resolved)
-                return {
-                    "requested": requested,
-                    "effective": DEVICE_OPTION_DEFAULT,
-                    "device": device,
-                    "cache_key": f"{DEVICE_OPTION_DEFAULT}:{device}",
-                    "source": "comfy",
-                    "warning": None,
-                }
-
             resolved = None
-            if hasattr(model_management, "resolve_gpu_device_option"):
-                resolved = model_management.resolve_gpu_device_option(requested)
-            if resolved is not None:
-                device = _device_to_string(resolved)
-                return {
-                    "requested": requested,
-                    "effective": requested,
-                    "device": device,
-                    "cache_key": f"{requested}:{device}",
-                    "source": "comfy",
-                    "warning": None,
-                }
-
-            default_device = _device_to_string(model_management.get_torch_device())
-            available_msg = f" Available options: {', '.join(available)}." if available else ""
+        if resolved is not None:
+            device = _device_to_string(resolved)
             return {
                 "requested": requested,
-                "effective": DEVICE_OPTION_DEFAULT,
-                "device": default_device,
-                "cache_key": f"{DEVICE_OPTION_DEFAULT}:{default_device}",
+                "effective": requested,
+                "device": device,
+                "cache_key": f"{requested}:{device}",
                 "source": "comfy",
-                "warning": f"Unsupported device override '{requested}'. Falling back to default.{available_msg}",
-            }
-        except Exception as e:
-            fallback = _legacy_default_device()
-            return {
-                "requested": requested,
-                "effective": DEVICE_OPTION_DEFAULT,
-                "device": fallback,
-                "cache_key": f"{DEVICE_OPTION_DEFAULT}:{fallback}",
-                "source": "legacy",
-                "warning": f"ComfyUI device helper failed ({type(e).__name__}); falling back to {fallback}.",
+                "warning": None,
             }
 
     if requested == DEVICE_OPTION_CPU:
@@ -258,13 +448,11 @@ def resolve_device_override(device_override: str | None = DEVICE_OPTION_DEFAULT)
             "warning": None,
         }
 
-    if requested.startswith(DEVICE_OPTION_PREFIX_GPU) and torch.cuda.is_available():
-        try:
-            index = int(requested[len(DEVICE_OPTION_PREFIX_GPU):])
-        except ValueError:
-            index = -1
-        if 0 <= index < _legacy_device_count():
-            device = f"cuda:{index}"
+    # IMPORTANT: partial ComfyUI hosts may expose only get_torch_device(); keep
+    # explicit GPU overrides independent from every optional host helper.
+    if gpu_index is not None and torch.cuda.is_available():
+        if gpu_index < _legacy_device_count():
+            device = f"cuda:{gpu_index}"
             return {
                 "requested": requested,
                 "effective": requested,
@@ -274,17 +462,14 @@ def resolve_device_override(device_override: str | None = DEVICE_OPTION_DEFAULT)
                 "warning": None,
             }
 
-    default_device = _legacy_default_device()
-    warning = None
-    if requested != DEVICE_OPTION_DEFAULT:
-        warning = f"Unsupported device override '{requested}'. Falling back to default."
+    default_device, source = _resolve_default_device(model_management)
     return {
         "requested": requested,
         "effective": DEVICE_OPTION_DEFAULT,
         "device": default_device,
         "cache_key": f"{DEVICE_OPTION_DEFAULT}:{default_device}",
-        "source": "legacy",
-        "warning": warning,
+        "source": source,
+        "warning": _device_override_warning(requested),
     }
 
 
@@ -322,9 +507,14 @@ def get_cuda_device_context(device: str):
         return nullcontext()
 
     model_management = _get_comfy_model_management()
-    if model_management is not None and hasattr(model_management, "cuda_device_context"):
+    context_helper = (
+        getattr(model_management, "cuda_device_context", None)
+        if model_management is not None
+        else None
+    )
+    if callable(context_helper):
         try:
-            return model_management.cuda_device_context(torch.device(device))
+            return context_helper(torch.device(device))
         except Exception:
             pass
     return _legacy_cuda_device_context(str(device))
@@ -502,7 +692,9 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
                 print(f"[TranslateGemma] Checking {len(shard_files)} shards from index")
                 
         except (json.JSONDecodeError, KeyError, IOError) as e:
-            missing.append(f"model.safetensors.index.json (parse error: {e})")
+            missing.append(
+                f"model.safetensors.index.json (parse error: {type(e).__name__})"
+            )
     else:
         # Single-file weights
         single_weight_files = ["model.safetensors", "pytorch_model.bin"]
@@ -564,7 +756,7 @@ def ensure_model_downloaded(
     is_complete, missing = _is_snapshot_complete(local_dir, debug=debug)
     
     if is_complete:
-        print(f"[TranslateGemma] Snapshot complete in {local_dir}, skipping download")
+        print("[TranslateGemma] Snapshot complete in configured model cache; skipping download")
         return True
     
     # Snapshot incomplete or missing
@@ -612,7 +804,6 @@ def ensure_model_downloaded(
             "access denied",
             "requires authentication",
             "invalid token",
-            "token",
         ]
         if any(kw in lower for kw in auth_keywords):
             return (
@@ -680,9 +871,9 @@ def ensure_model_downloaded(
             resume_download=True,  # TG-027: Resume partial downloads
         )
     
-    print(f"[TranslateGemma] Downloading {repo_id} to {local_dir}...")
+    print(f"[TranslateGemma] Downloading {repo_id} to configured model cache...")
     if revision:
-        print(f"[TranslateGemma] Using revision: {revision}")
+        print("[TranslateGemma] Using configured revision")
     
     # TG-052: Clearer download diagnostics + small retry loop
     retries_env = os.environ.get("TRANSLATEGEMMA_DOWNLOAD_RETRIES", "").strip()
@@ -705,7 +896,10 @@ def ensure_model_downloaded(
             if attempt < max_attempts:
                 # Basic backoff (1s, 2s, 4s...)
                 backoff = 2 ** (attempt - 1)
-                print(f"[TranslateGemma] Download failed: {type(e).__name__}: {e}")
+                print(
+                    f"[TranslateGemma] Download failed (kind={kind}, "
+                    f"error_type={type(e).__name__})"
+                )
                 print(f"[TranslateGemma] Retrying in {backoff}s... ({hint})")
                 try:
                     import time
@@ -717,7 +911,7 @@ def ensure_model_downloaded(
                 break
 
     if last_exc is None:
-        print(f"[TranslateGemma] Download complete: {local_dir}")
+        print("[TranslateGemma] Download complete in configured model cache")
         
         # TG-027: Post-download verification
         is_complete_after, missing_after = _is_snapshot_complete(local_dir, debug=debug)
@@ -726,7 +920,7 @@ def ensure_model_downloaded(
             raise RuntimeError(
                 f"Download completed but snapshot still incomplete. "
                 f"Missing: {', '.join(capped)}. "
-                f"Try deleting '{local_dir}' and retrying."
+                "Try deleting the incomplete model cache folder and retrying."
             )
         
         return True
@@ -751,9 +945,8 @@ def ensure_model_downloaded(
             "2. Authenticate with Hugging Face (one of):\n"
             "   - Run: hf auth login\n"
             "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
-            "3. Restart ComfyUI\n\n"
-            f"Original error: {last_exc}"
-        ) from last_exc
+            "3. Restart ComfyUI"
+        ) from None
 
     # Generic / network / disk
     endpoint = os.environ.get("HF_ENDPOINT") or os.environ.get("HUGGINGFACE_HUB_ENDPOINT") or ""
@@ -762,7 +955,7 @@ def ensure_model_downloaded(
 
     extra_lines = []
     if endpoint:
-        extra_lines.append(f"- HF endpoint: {endpoint}")
+        extra_lines.append("- Custom HF endpoint configured")
     if proxy_http or proxy_https:
         extra_lines.append("- Proxy configured via HTTP(S)_PROXY")
 
@@ -779,12 +972,12 @@ def ensure_model_downloaded(
 
     raise RuntimeError(
         f"Failed to download model '{repo_id}'.\n\n"
-        f"[Cause]\n{type(last_exc).__name__}: {last_exc}\n\n"
+        f"[Cause]\n{kind} download failure ({type(last_exc).__name__})\n\n"
         f"[Hint]\n{hint}\n\n"
-        f"[Cache dir]\n{local_dir}"
+        "[Cache dir]\n[configured model cache]"
         f"{local_snapshot_context}"
         f"{extra_context}"
-    ) from last_exc
+    ) from None
 
 
 def unload_current_model():
@@ -857,7 +1050,6 @@ def _build_load_context(
     repo_id: str,
     device: str,
     dtype,
-    cache_dir: str,
     revision: str = None,
     device_override: str = DEVICE_OPTION_DEFAULT,
     effective_device_option: str = DEVICE_OPTION_DEFAULT,
@@ -872,26 +1064,24 @@ def _build_load_context(
         f"repo_id: {repo_id}",
         f"device: {device}",
         f"dtype: {dtype}",
-        f"cache_dir: {cache_dir}",
         f"device_override: {device_override}",
         f"effective_device_option: {effective_device_option}",
     ]
     if revision:
-        lines.append(f"revision: {revision}")
+        lines.append("revision: configured")
     return " | ".join(lines)
 
-def _raise_auth_error(repo_id: str, original_error: Exception):
+def _raise_auth_error(repo_id: str):
     """Raise user-friendly error for gated model access issues (TG-004)."""
-    raise RuntimeError(
+    raise _SafeModelLoadError(
         f"Failed to access model '{repo_id}' - this may be a gated model.\n\n"
         "To resolve:\n"
         "1. Visit the model page on Hugging Face and accept the license terms\n"
         "2. Authenticate with Hugging Face (one of):\n"
         "   - Run: hf auth login\n"
         "   - Or set: HF_TOKEN=your_token_here (or HUGGINGFACE_HUB_TOKEN)\n"
-        "3. Restart ComfyUI\n\n"
-        f"Original error: {original_error}"
-    )
+        "3. Restart ComfyUI"
+    ) from None
 
 
 def _get_bnb_compute_dtype() -> torch.dtype:
@@ -938,48 +1128,43 @@ def _check_bnb_availability(quantization: str, device: str) -> None:
     if quantization == "none":
         return
 
-    # 1. Check CUDA requirement
+    # This project keeps a narrower policy than upstream BnB until each host backend is tested.
     if not device.startswith("cuda"):
         raise RuntimeError(
-            f"bitsandbytes quantization (quantization={quantization}) requires a CUDA GPU.\n"
-            f"Current device: {device}\n\n"
+            f"TranslateGemma bitsandbytes mode (quantization={quantization}) is currently enabled "
+            "only for this project's CUDA device path.\n\n"
             "To resolve:\n"
-            "- Use a machine with an NVIDIA GPU and CUDA installed, OR\n"
-            "- Set quantization=none to load the model without quantization"
+            "- Select a CUDA device supported by the active ComfyUI environment, OR\n"
+            "- Set quantization=none to use the host's normal model-loading path\n"
+            "Official upstream backend availability does not imply project-level support."
         )
 
-    # IMPORTANT: keep this import inside the BnB-only branch. Base installs and
-    # quantization=none must work without the optional native bitsandbytes package.
+    # IMPORTANT: keep this import inside the BnB-only branch and redact every
+    # native-loader failure; these errors often expose local library paths.
     try:
         import bitsandbytes  # noqa: F401
-    except ImportError as e:
+    except Exception:
         raise RuntimeError(
             f"bitsandbytes quantization (quantization={quantization}) requires bitsandbytes to be installed.\n\n"
             "To resolve:\n"
-            "- Install optional quantization dependencies: pip install -r requirements-quantization.txt\n"
-            "- Or install bitsandbytes into ComfyUI's Python environment: pip install bitsandbytes\n"
-            "- Windows users: see https://github.com/jllllll/bitsandbytes-windows-webui for prebuilt wheels\n"
-            "- Or set quantization=none to load the model without quantization\n\n"
-            f"Import error: {e}"
-        ) from e
+            "- In ComfyUI's Python environment, run: python -m pip install -r requirements-quantization.txt\n"
+            "- Or run: python -m pip install \"bitsandbytes>=0.49.2\"\n"
+            "- Official instructions: https://huggingface.co/docs/bitsandbytes/installation\n"
+            "- Or set quantization=none to use the host's normal model-loading path\n\n"
+            "Do not replace ComfyUI's PyTorch build as part of this optional install."
+        ) from None
 
     # 3. Check BitsAndBytesConfig in transformers
     try:
         from transformers import BitsAndBytesConfig  # noqa: F401
-    except ImportError as e:
-        try:
-            import transformers
-            tf_version = getattr(transformers, "__version__", "unknown")
-        except Exception:
-            tf_version = "unknown"
+    except ImportError:
         raise RuntimeError(
             f"bitsandbytes quantization (quantization={quantization}) requires BitsAndBytesConfig from transformers.\n"
-            f"Current transformers version: {tf_version}\n\n"
-            "To resolve:\n"
-            "- Upgrade transformers: pip install --upgrade transformers\n"
-            "- Or set quantization=none to load the model without quantization\n\n"
-            f"Import error: {e}"
-        ) from e
+            "To resolve in ComfyUI's Python environment:\n"
+            "- Reinstall this node's declared requirements without replacing the host's PyTorch build\n"
+            "- Or set quantization=none to use the host's normal model-loading path\n"
+            "- Integration guide: https://huggingface.co/docs/transformers/main/quantization/bitsandbytes"
+        ) from None
 
 
 def _build_quantization_config(quantization: str):
@@ -1012,6 +1197,7 @@ def _build_quantization_config(quantization: str):
         raise ValueError(f"Invalid quantization mode: {quantization}. Choose from: {QUANTIZATION_OPTIONS}")
 
 
+@serialized_model_access
 def load_model(
     model_size: str,
     revision: Optional[str] = None,
@@ -1041,6 +1227,7 @@ def load_model(
     resolved_device_key = str(device_selection["cache_key"])
     effective_device_option = str(device_selection["effective"])
     requested_device_option = str(device_selection["requested"])
+    requested_device_label = _safe_device_option_label(requested_device_option)
 
     # Check env var for revision override
     env_revision = os.environ.get("TRANSLATEGEMMA_REVISION")
@@ -1086,15 +1273,17 @@ def load_model(
         print(f"[TranslateGemma] WARNING: {device_selection['warning']}")
     print(
         f"[TranslateGemma] Device: {device}, dtype: {dtype}, quantization: {quantization}, "
-        f"device_override={requested_device_option}, effective_device={effective_device_option}"
+        f"device_override={requested_device_label}, effective_device={effective_device_option}"
     )
-    print(f"[TranslateGemma] Cache dir: {cache_dir}")
+    print("[TranslateGemma] Cache dir: [configured model cache]")
     if revision:
-        print(f"[TranslateGemma] Revision: {revision}")
+        print("[TranslateGemma] Revision: [configured]")
 
     # TG-014: Check bitsandbytes availability before loading
     _check_bnb_availability(quantization, device)
 
+    processor = None
+    model = None
     try:
         if AutoProcessor is None or AutoModelForImageTextToText is None:
             raise RuntimeError(
@@ -1117,35 +1306,24 @@ def load_model(
         load_source = cache_dir if snapshot_complete else repo_id
         local_files_only = bool(snapshot_complete)
         if snapshot_complete:
-            print(f"[TranslateGemma] Using local snapshot for load: {cache_dir} (local_files_only=True)")
+            print("[TranslateGemma] Using complete local snapshot (local_files_only=True)")
         else:
             print(f"[TranslateGemma] Local snapshot incomplete; loading via repo id: {repo_id}")
 
-        # TG-006 + TG-026: Try without trust_remote_code first, fall back if policy allows
-        remote_code_allowed, policy_reason = _is_remote_code_allowed(repo_id)
-
-        try:
-            processor = AutoProcessor.from_pretrained(
-                load_source,
-                cache_dir=cache_dir,
-                revision=revision,
-                local_files_only=local_files_only,
-                trust_remote_code=False,
-            )
-        except Exception as load_err:
-            if not remote_code_allowed:
-                raise RuntimeError(
-                    f"Loading '{repo_id}' requires remote code, but policy denies it ({policy_reason}). "
-                    f"Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 to allow, or add the repo to allowlist."
-                ) from load_err
-            print(f"[TranslateGemma] Loading processor with trust_remote_code=True (policy: {policy_reason})")
-            processor = AutoProcessor.from_pretrained(
-                load_source,
-                cache_dir=cache_dir,
-                revision=revision,
-                local_files_only=local_files_only,
-                trust_remote_code=True,
-            )
+        processor = _load_pretrained_with_security_policy(
+            AutoProcessor,
+            load_source,
+            {
+                "cache_dir": cache_dir,
+                "revision": revision,
+                "local_files_only": local_files_only,
+                "trust_remote_code": False,
+            },
+            repo_id=repo_id,
+            revision=revision,
+            stage="processor",
+            allow_weight_fallback=False,
+        )
 
         # TG-014: Build quantization config
         quantization_config = _build_quantization_config(quantization)
@@ -1167,30 +1345,16 @@ def load_model(
         if quantization_config:
             model_kwargs["quantization_config"] = quantization_config
 
-        try:
-            with get_cuda_device_context(device):
-                model = AutoModelForImageTextToText.from_pretrained(
-                    load_source,
-                    **model_kwargs,
-                )
-        except Exception as e:
-            if "safetensors" in str(e).lower():
-                print("[TranslateGemma] safetensors not available, falling back to .bin")
-
-            if not remote_code_allowed:
-                raise RuntimeError(
-                    f"Loading '{repo_id}' model weights requires remote code, but policy denies it ({policy_reason}). "
-                    f"Set TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1 to allow."
-                ) from e
-
-            print(f"[TranslateGemma] Loading model with trust_remote_code=True (policy: {policy_reason})")
-            model_kwargs["trust_remote_code"] = True
-            model_kwargs.pop("use_safetensors", None)  # Remove safetensors preference for fallback
-            with get_cuda_device_context(device):
-                model = AutoModelForImageTextToText.from_pretrained(
-                    load_source,
-                    **model_kwargs,
-                )
+        with get_cuda_device_context(device):
+            model = _load_pretrained_with_security_policy(
+                AutoModelForImageTextToText,
+                load_source,
+                model_kwargs,
+                repo_id=repo_id,
+                revision=revision,
+                stage="model",
+                allow_weight_fallback=True,
+            )
 
         # TG-014: Do not call model.to(device) for quantized models (already device-mapped)
         if not device.startswith("cuda") and quantization == "none":
@@ -1199,25 +1363,29 @@ def load_model(
         # TG-007: Set model to eval mode for inference
         model.eval()
 
-        # TG-029: Thread-safe cache write
-        # TG-014: Store full model key including quantization
-        with _MODEL_CACHE_LOCK:
-            _current_model = (model, processor)
-            _current_model_key = model_key
+        # TG-014: Store full model key including quantization. The lifecycle
+        # decorator retains exclusive ownership through this publication.
+        _current_model = (model, processor)
+        _current_model_key = model_key
 
         print(
             f"[TranslateGemma] {model_size} model loaded successfully on {device} "
-            f"(eval mode, quantization={quantization}, device_override={requested_device_option})"
+            f"(eval mode, quantization={quantization}, device_override={requested_device_label})"
         )
         return model, processor
 
     except Exception as e:
-        # Clean up any partially loaded resources
+        # Drop partial objects before allocator cleanup so collection is effective.
+        model = None
+        processor = None
         cleanup_torch_memory()
+
+        if isinstance(e, _SafeModelLoadError):
+            raise
 
         # TG-004: Detect gated/auth errors and provide actionable guidance
         if _detect_auth_error(e):
-            _raise_auth_error(repo_id, e)
+            _raise_auth_error(repo_id)
 
         # TG-008: Include context in error message
         context = _build_load_context(
@@ -1225,13 +1393,15 @@ def load_model(
             repo_id,
             device,
             dtype,
-            cache_dir,
             revision,
-            device_override=requested_device_option,
+            device_override=requested_device_label,
             effective_device_option=effective_device_option,
         )
         context += f" | quantization: {quantization}"
-        raise RuntimeError(f"Failed to load TranslateGemma: {e}\n[Context] {context}") from e
+        raise _SafeModelLoadError(
+            "Failed to load TranslateGemma. Check model access, local storage, dependency "
+            f"compatibility, and device configuration.\n[Context] {context}"
+        ) from None
 
 
 def unload_model(model_size: str = None):
@@ -1251,18 +1421,21 @@ def get_available_models() -> list[str]:
 
 def get_current_model_size() -> Optional[str]:
     """Return the currently loaded model size, or None if no model is loaded."""
-    if _current_model_key is None:
-        return None
-    return _current_model_key[0]
+    with _MODEL_CACHE_LOCK:
+        if _current_model_key is None:
+            return None
+        return _current_model_key[0]
 
 
 def get_current_quantization() -> Optional[str]:
     """Return the currently loaded model's quantization mode, or None if no model is loaded (TG-014)."""
-    if _current_model_key is None:
-        return None
-    return _current_model_key[1] if len(_current_model_key) > 1 else "none"
+    with _MODEL_CACHE_LOCK:
+        if _current_model_key is None:
+            return None
+        return _current_model_key[1] if len(_current_model_key) > 1 else "none"
 
 
 def is_model_loaded() -> bool:
     """Check if a model is currently loaded."""
-    return _current_model is not None
+    with _MODEL_CACHE_LOCK:
+        return _current_model is not None

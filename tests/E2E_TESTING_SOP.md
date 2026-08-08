@@ -2,7 +2,7 @@
 
 This SOP defines the E2E workflow policy for this repository.
 
-Current repo fact: there is no `package.json`, npm script, or Playwright harness. E2E is therefore non-applicable until such a harness is added. Use targeted static/unit validation as the replacement lane and record that substitution with the validation evidence.
+Current repo fact: `package.json` and a Playwright harness exist. The harness validates the frontend contract against an explicitly supplied, already-running local ComfyUI host. Missing live-host evidence blocks frontend acceptance.
 
 ## Problem-First Test Design Rule
 
@@ -17,7 +17,14 @@ When adding or reviewing E2E coverage, prefer assertions that prove final user-v
 - Python command available (`python` or a local shim to `python3`) when the harness serves files through Python.
 - Playwright Chromium installed with `npx playwright install chromium` when Playwright is used.
 
-The commands below apply only after a real Node/Playwright harness exists.
+## Required Host Contract
+
+- The user or maintainer explicitly supplies the already-running host URL.
+- `COMFYUI_TEST_URL` must be a loopback HTTP(S) URL without credentials, query, or fragment.
+- `COMFYUI_TEST_FRONTEND_VERSION` must be the host's actual semantic frontend version.
+- The host must load this workspace's TranslateGemma custom node.
+- Do not run, build, install, or serve a `REFERENCE/` checkout.
+- The harness preserves and restores renderer settings and must not queue prompts or save workflows.
 
 ## Windows (PowerShell)
 
@@ -26,7 +33,9 @@ node -v
 npm -v
 python --version
 
-npm install
+$env:COMFYUI_TEST_URL = 'http://127.0.0.1:8188'
+$env:COMFYUI_TEST_FRONTEND_VERSION = '<actual-version>'
+npm ci
 npx playwright install chromium
 npm test
 ```
@@ -42,7 +51,9 @@ python3 --version
 mkdir -p .tmp/bin
 ln -sf "$(command -v python3)" .tmp/bin/python
 
-npm install
+export COMFYUI_TEST_URL='http://127.0.0.1:8188'
+export COMFYUI_TEST_FRONTEND_VERSION='<actual-version>'
+npm ci
 npx playwright install chromium
 
 mkdir -p .tmp/playwright
@@ -57,6 +68,6 @@ TMPDIR=.tmp/playwright TMP=.tmp/playwright TEMP=.tmp/playwright \
 - Browser missing: run `npx playwright install chromium`.
 - Dependency drift: remove `node_modules` and rerun `npm install`.
 
-## Non-Applicable E2E
+## Missing Host
 
-If the repo does not have a frontend or Playwright harness for the changed surface, document the non-applicability and identify the replacement smoke, unit, or integration lane. Do not treat a missing E2E harness as an unrecorded pass.
+If the approved local host is not available, `npm run test:contract` may still be used as an intermediate diagnostic lane. It is not a substitute for `npm test`, and the item remains `IMPLEMENTED_NOT_ACCEPTED` until live E2E and visual evidence pass.

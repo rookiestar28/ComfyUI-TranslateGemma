@@ -2,6 +2,8 @@
 
 Translate text with Google's TranslateGemma instruction models inside ComfyUI. The node supports text translation, image text translation through the multimodal model path, Chinese Simplified/Traditional conversion-only mode, and long-text strategies.
 
+Open ComfyUI's **Node Library**, find **TranslateGemma**, and use **Learn More** to view this native Node Help page. The same help content is available with Classic and Vue Nodes.
+
 ## Inputs
 
 - `text`: Built-in text input. Ignored when `external_text` is connected.

@@ -17,7 +17,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
 - Added `device` override (`default` / `cpu` / `gpu:N`) aligned with ComfyUI device management when available.
 - Added optional BitsAndBytes quantization (`quantization`: `none` / `bnb-8bit` / `bnb-4bit`) for best-effort VRAM reduction.
-- Added native ComfyUI node docs, a node UI `?` help modal, `0 = auto` labels for max token widgets, and importable example workflows.
+- Added native ComfyUI Node Help for Classic and Vue Nodes, `0 = auto` labels for max token widgets, and importable example workflows.
 - Improved Hugging Face download diagnostics (network/auth/disk hints + retries) and added troubleshooting guidance (proxy/mirror/offline).
 
 ---
@@ -59,7 +59,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - Host-aligned device override: `default`, `cpu`, or `gpu:N` when available
 - Optional BitsAndBytes quantization as a separate install path
 - Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model
-- Native node docs, in-node help, and example workflows
+- Native Node Help through ComfyUI's Node Library in both Classic and Vue Nodes, plus example workflows
 
 ## Installation
 
@@ -85,13 +85,13 @@ cd ComfyUI-TranslateGemma
 pip install -r requirements.txt
 ```
 
-3) Optional, only for `quantization=bnb-8bit` / `quantization=bnb-4bit` on CUDA:
+3) Optional, only for `quantization=bnb-8bit` / `quantization=bnb-4bit` on this project's CUDA path:
 
 ```bash
 pip install -r requirements-quantization.txt
 ```
 
-ComfyUI Desktop and portable ComfyUI users must run this with the Python environment used by ComfyUI, not a separate global Python. If optional BitsAndBytes install fails, keep `quantization=none`.
+ComfyUI Desktop and portable ComfyUI users must run this with the Python environment used by ComfyUI, not a separate global Python. This installs `bitsandbytes>=0.49.2` and does not replace ComfyUI's PyTorch build. If the optional install or backend check fails, keep `quantization=none`.
 
 4) Restart ComfyUI.
 
@@ -417,36 +417,39 @@ The `quantization` input allows you to load the model in lower precision using [
 | `bnb-8bit` | ~50% | Good | 8-bit quantization |
 | `bnb-4bit` | ~75% | Acceptable | 4-bit NF4 quantization |
 
-### Requirements
+### Requirements and support boundary
 
-- **CUDA GPU**: bitsandbytes quantization only works on NVIDIA GPUs with CUDA
-- **bitsandbytes installed in the ComfyUI Python environment**: `pip install -r requirements-quantization.txt` or `pip install bitsandbytes`
-- **transformers with BitsAndBytesConfig**: `pip install --upgrade transformers`
+- Install `bitsandbytes>=0.49.2` into the Python environment already used by ComfyUI: `python -m pip install -r requirements-quantization.txt`.
+- Use the PyTorch and accelerator build supplied by ComfyUI. The optional install does not replace ComfyUI's PyTorch.
+- Upstream BitsAndBytes requires Python 3.10+ and PyTorch 2.4+; this project declares its separately tested Python range in `pyproject.toml`.
+- Official installation and platform tables: <https://huggingface.co/docs/bitsandbytes/installation>.
 
-`bitsandbytes` is intentionally not included in the base `requirements.txt`. Base installs and `quantization=none` work without it.
+`bitsandbytes` is intentionally absent from base `requirements.txt`. Base installs and `quantization=none` do not import or require it.
+
+Official upstream packages currently describe NVIDIA CUDA, AMD ROCm, Intel XPU, Intel HPU/Gaudi, CPU, and Apple Silicon/MPS paths. That upstream availability is not the same as project support. This release keeps TranslateGemma's BnB integration on the existing **CUDA-only, best-effort** path. ROCm, XPU, HPU, CPU, and MPS model loading remain deferred until this project has device-map, load, and inference evidence for each backend. Official Windows x86-64 wheels include CUDA 13.0 builds, but this repository's package-only check does not prove a real TranslateGemma GPU run.
 
 ### Troubleshooting
 
-"bitsandbytes quantization requires a CUDA GPU":
+"TranslateGemma bitsandbytes mode ... only for this project's CUDA device path":
 
-- You're running on CPU or MPS (Apple Silicon)
-- Set `quantization=none` or use a CUDA-capable GPU
+- The selected ComfyUI device is outside this project's currently verified integration path.
+- Set `quantization=none` or select a CUDA device already supported by the active ComfyUI environment.
 
 "bitsandbytes not installed":
 
-- Install into the ComfyUI Python environment: `pip install -r requirements-quantization.txt` or `pip install bitsandbytes`
-- Windows users: see [bitsandbytes-windows-webui](https://github.com/jllllll/bitsandbytes-windows-webui) for prebuilt wheels (third-party, evaluate risk yourself)
-- ComfyUI Desktop users: quantization may require manual bitsandbytes installation; if install fails, use `quantization=none` or run the 4B model
+- Install into the ComfyUI Python environment: `python -m pip install -r requirements-quantization.txt` or `python -m pip install "bitsandbytes>=0.49.2"`.
+- Use only the [official BitsAndBytes installation guide](https://huggingface.co/docs/bitsandbytes/installation) and official PyPI packages.
+- ComfyUI Desktop users should keep the host's PyTorch build. If installation or backend loading fails, use `quantization=none` or the 4B model.
 
 "BitsAndBytesConfig not found":
 
-- Upgrade transformers: `pip install --upgrade transformers`
+- Reinstall this node's declared requirements in the ComfyUI Python environment; do not replace the host's PyTorch build.
 
 "CUDA Setup failed" or "libbitsandbytes_cudaXXX not found" (import succeeds but loading fails):
 
 - This means bitsandbytes was built for a different CUDA version or your GPU's compute capability is unsupported
 - Set `quantization=none` as a workaround
-- Include the full error message when reporting issues
+- Report the fixed user-facing message and package versions; redact local paths, environment values, tokens, and native-loader details.
 
 ### Environment Variables (Advanced)
 
@@ -457,20 +460,27 @@ The `quantization` input allows you to load the model in lower precision using [
 
 - Quantization is **best-effort**: TranslateGemma official docs do not explicitly promise bitsandbytes support
 - Translation quality may degrade slightly with quantization
-- Not supported on CPU or MPS (Apple Silicon) — only CUDA GPUs
-- Windows/Desktop users may encounter install issues with bitsandbytes
+- Project support is deliberately narrower than upstream: only the CUDA path is currently enabled, and it remains best-effort without a real gated-model GPU acceptance lane.
+- ROCm, XPU, HPU, CPU, and MPS/Apple integration is deferred rather than implied by upstream wheel availability.
 
 ## Security / Reproducibility Notes
 
 ### Remote Code Policy
 
-- The loader attempts `trust_remote_code=False` first and only falls back to `True` if required.
-- Set `TRANSLATEGEMMA_ALLOW_REMOTE_CODE=0` to deny remote code entirely (fails if code is needed).
-- Set `TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST=google/translategemma-4b-it,google/translategemma-12b-it` to allow only specific repos.
+- The loader always starts with `trust_remote_code=False` and retries only when Transformers explicitly reports that repository custom code is required.
+- Remote code is denied by default. Set `TRANSLATEGEMMA_ALLOW_REMOTE_CODE=1` only after reviewing the repository code.
+- Optionally set `TRANSLATEGEMMA_REMOTE_CODE_ALLOWLIST=google/translategemma-4b-it,google/translategemma-12b-it` to require an exact repository match in addition to the explicit opt-in.
+- Authentication, network, disk, dependency, safetensors, and generic model-loading errors never authorize remote code.
+
+### Weight Format Policy
+
+- Safetensors are required by default. Remote-code permission does not permit pickle-backed model weights.
+- If a reviewed model is available only in a non-safetensors format, set `TRANSLATEGEMMA_ALLOW_UNSAFE_WEIGHTS=1` as a separate explicit opt-in.
+- Non-safetensors weights can execute code while being deserialized. Enable this option only for a trusted, pinned model source.
 
 ### Revision Pinning
 
-- You can pin a specific revision for reproducibility via `TRANSLATEGEMMA_REVISION=<commit-or-tag>`.
+- Pin a specific commit revision for reproducibility via `TRANSLATEGEMMA_REVISION=<commit-hash>`, especially whenever remote code or non-safetensors weights are enabled.
 
 ### Debug Privacy
 

@@ -1,0 +1,13 @@
+{
+  "name": "comfyui-translategemma-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:contract && npm run test:host",
+    "test:contract": "node --test tests/frontend/*.test.mjs",
+    "test:host": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

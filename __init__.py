@@ -8,9 +8,9 @@ automatic model downloading and 55 language support.
 
 import os
 
+from ._version import __version__
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-__version__ = "1.2.3"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 # ComfyUI registration

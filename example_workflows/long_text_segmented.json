@@ -42,7 +42,7 @@
         "Node name for S&R": "TranslateGemma"
       },
       "widgets_values": [
-        "Paragraph one: This is a longer source document.\n\nParagraph two: The segmented strategy translates each paragraph separately and preserves blank lines.",
+        "",
         "Chinese (Traditional)",
         "4B",
         "default",
@@ -61,7 +61,28 @@
         "auto_flip",
         "segmented",
         "none"
-      ]
+      ],
+      "widgets_values_named": {
+        "text": "",
+        "target_language": "Chinese (Traditional)",
+        "model_size": "4B",
+        "device": "default",
+        "image_enhance": false,
+        "image_resize_mode": "letterbox",
+        "image_two_pass": true,
+        "source_language": "Auto Detect",
+        "prompt_mode": "auto",
+        "max_new_tokens": 0,
+        "max_input_tokens": 0,
+        "truncate_input": true,
+        "strict_context_limit": true,
+        "keep_model_loaded": true,
+        "debug": false,
+        "chinese_conversion_only": false,
+        "chinese_conversion_direction": "auto_flip",
+        "long_text_strategy": "segmented",
+        "quantization": "none"
+      }
     }
   ],
   "links": [],

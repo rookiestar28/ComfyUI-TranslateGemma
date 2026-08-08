@@ -6,15 +6,16 @@ This document defines the source-of-truth local verification workflow for this r
 
 - Repository hygiene checks through `pre-commit`.
 - Backend/unit tests through Python `unittest`.
-- Frontend/E2E checks only when a Node or Playwright harness exists.
+- Frontend contract and host-backed Playwright E2E checks.
 - Static/type validation when a changed surface has a typed or generated contract.
 
 ## Current Repo Facts
 
-- The repository currently has no `package.json`, npm script, or Playwright harness.
+- The repository has a Playwright harness for the TranslateGemma frontend contract.
+- `npm test` requires an explicitly supplied, already-running loopback ComfyUI host that loads this workspace's custom node.
+- The harness never starts, builds, or executes a `REFERENCE/` checkout.
 - The repository currently has no one-command full-test wrapper script.
 - The canonical unit-test command is `python -m unittest discover -s tests -p "test_*.py"`.
-- For E2E-sensitive changes, use targeted static/unit coverage as the replacement lane until a real harness exists.
 
 ## Required Reading Order
 
@@ -32,9 +33,7 @@ Required shared gate:
 2. `pre-commit run --all-files --show-diff-on-failure`
 3. `python -m unittest discover -s tests -p "test_*.py"`
 4. Targeted static/unit validation for the changed surface.
-5. E2E validation only when a real harness exists; otherwise record the non-applicability and replacement lane.
-
-If this repo has no frontend/E2E harness for the changed surface, record the non-applicability and identify the replacement smoke, unit, or integration lane that catches the same user-facing risk.
+5. `npm test` against the approved local host, including Node contract tests and Classic/Vue Playwright tests.
 
 ## Problem-First Test Design Rule
 
@@ -84,7 +83,11 @@ $env:PRE_COMMIT_HOME = (Join-Path (Get-Location).ProviderPath '.tmp\pre-commit')
 .\.venv\Scripts\pre-commit.exe run --all-files --show-diff-on-failure
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 node -v
-if (Test-Path package.json) { npm test } else { "NO_PACKAGE_JSON_E2E_NON_APPLICABLE" }
+$env:COMFYUI_TEST_URL = 'http://127.0.0.1:8188'
+$env:COMFYUI_TEST_FRONTEND_VERSION = '<actual-version>'
+npm test
 git diff --check
 git diff --cached --check
 ```
+
+The URL and frontend version are examples. Use the actual explicitly supplied loopback host and its actual semantic frontend version. A missing host is a blocking E2E result, not a non-applicable pass.

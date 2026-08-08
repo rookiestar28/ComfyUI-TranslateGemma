@@ -2,6 +2,8 @@
 
 These workflows are minimal templates that depend only on the `TranslateGemma` node. Import them from ComfyUI's workflow menu, then adjust language/model settings for your environment.
 
+The JSON files keep both legacy positional widget values and the additive named widget map written by frontend 1.49.2+. Their text fields are intentionally empty so distributed templates never contain prompt or user content; enter your own text after importing.
+
 ## Files
 
 - `basic_text_translation.json`: simple English to Japanese text translation.

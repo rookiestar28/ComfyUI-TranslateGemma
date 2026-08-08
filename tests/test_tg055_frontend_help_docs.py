@@ -40,17 +40,20 @@ class FrontendHelpDocsTests(unittest.TestCase):
         for token in forbidden:
             self.assertNotIn(token, docs)
 
-    def test_frontend_extension_has_patch_guard_and_label_fallback(self):
+    def test_frontend_extension_has_renderer_independent_label_fallback(self):
         js = (ROOT / "web" / "extensions" / "translategemma_help.js").read_text(encoding="utf-8")
+        contract = (
+            ROOT / "web" / "extensions" / "translategemma_help_contract.js"
+        ).read_text(encoding="utf-8")
 
-        self.assertIn("const NODE_NAME = \"TranslateGemma\";", js)
-        self.assertIn("const PATCH_FLAG = \"__tgHelpPatched\";", js)
-        self.assertIn("if (!isTranslateGemmaNode(nodeData)) return;", js)
-        self.assertIn("nodeType.prototype[PATCH_FLAG]", js)
-        self.assertIn("const LABEL_FALLBACKS", js)
-        self.assertIn("existingLabel && existingLabel !== w.name", js)
-        self.assertIn("optional <code>bitsandbytes</code>", js)
-        self.assertIn("<code>device</code>", js)
+        self.assertIn("nodeCreated(node)", js)
+        self.assertIn("applyWidgetLabelFallbacks(node)", js)
+        self.assertNotIn("beforeRegisterNodeDef", js)
+        self.assertNotIn("onDrawForeground", js)
+        self.assertNotIn("innerHTML", js)
+        self.assertIn('export const NODE_NAME = "TranslateGemma";', contract)
+        self.assertIn("export const LABEL_FALLBACKS", contract)
+        self.assertIn("isMeaningfulLabel", contract)
 
 
 if __name__ == "__main__":

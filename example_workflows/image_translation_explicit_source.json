@@ -42,7 +42,7 @@
         "Node name for S&R": "TranslateGemma"
       },
       "widgets_values": [
-        "Connect an IMAGE input to this node. Image translation ignores this text field when image is connected.",
+        "",
         "English",
         "4B",
         "default",
@@ -61,7 +61,28 @@
         "auto_flip",
         "disable",
         "none"
-      ]
+      ],
+      "widgets_values_named": {
+        "text": "",
+        "target_language": "English",
+        "model_size": "4B",
+        "device": "default",
+        "image_enhance": true,
+        "image_resize_mode": "letterbox",
+        "image_two_pass": true,
+        "source_language": "Japanese",
+        "prompt_mode": "auto",
+        "max_new_tokens": 512,
+        "max_input_tokens": 2048,
+        "truncate_input": true,
+        "strict_context_limit": true,
+        "keep_model_loaded": true,
+        "debug": false,
+        "chinese_conversion_only": false,
+        "chinese_conversion_direction": "auto_flip",
+        "long_text_strategy": "disable",
+        "quantization": "none"
+      }
     }
   ],
   "links": [],

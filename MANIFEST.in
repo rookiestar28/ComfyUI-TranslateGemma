@@ -1,0 +1,21 @@
+include __init__.py
+include _version.py
+include pyproject.toml
+include README.md
+include LICENSE
+include requirements.txt
+include requirements-quantization.txt
+recursive-include nodes *.py
+recursive-include utils *.py
+recursive-include web *.js *.md
+recursive-include example_workflows *.json *.md
+prune tests
+prune scripts
+prune .planning
+prune reference
+prune REFERENCE
+prune .sessions
+prune output
+prune .tmp
+global-exclude *.py[cod]
+global-exclude __pycache__

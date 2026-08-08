@@ -14,7 +14,8 @@ from ..utils.chinese_postedit import postedit_traditional_chinese
 from ..utils.chinese_convert import convert_chinese_variants, is_chinese_variant_code, infer_chinese_variant
 from ..utils.model_loader import (
     load_model, get_available_models, unload_current_model,
-    cleanup_torch_memory, get_device, get_device_options, get_torch_dtype, get_model_path, MODEL_REPOS,
+    get_device, get_device_options, get_torch_dtype, get_model_path, MODEL_REPOS,
+    serialized_model_access,
     QUANTIZATION_OPTIONS,  # TG-014
 )
 from ..utils.prompt_builder import (
@@ -313,14 +314,17 @@ class TranslateGemmaNode:
                 }),
                 "image_enhance": ("BOOLEAN", {
                     "default": False,
+                    "advanced": True,
                     "tooltip": "Mild contrast/sharpening to help small text visibility; may introduce artifacts on some images.",
                 }),
                 "image_resize_mode": (["letterbox", "processor", "stretch"], {
                     "default": "letterbox",
+                    "advanced": True,
                     "tooltip": "letterbox: preserve aspect ratio (pad to 896×896, recommended). processor: official resize (may stretch). stretch: force 896×896 (may distort).",
                 }),
                 "image_two_pass": ("BOOLEAN", {
                     "default": True,
+                    "advanced": True,
                     "tooltip": "Extract text from image first (source→source), then translate extracted text (more accurate, slower).",
                 }),
                 "source_language": (["Auto Detect"] + languages, {
@@ -333,10 +337,12 @@ class TranslateGemmaNode:
                 }),
                 "prompt_mode": (prompt_modes, {
                     "default": "auto",
+                    "advanced": True,
                     "tooltip": "auto: structured first, fallback to plain. structured: fail loudly if chat template unavailable. plain: instruction-only (no chat template).",
                 }),
                 "max_new_tokens": ("INT", {
                     "default": 512,
+                    "advanced": True,
                     "min": 0,
                     "max": 8192,
                     "step": 16,
@@ -348,6 +354,7 @@ class TranslateGemmaNode:
                 }),
                 "max_input_tokens": ("INT", {
                     "default": 2048,
+                    "advanced": True,
                     "min": 0,
                     "max": 8192,
                     "step": 64,
@@ -357,18 +364,22 @@ class TranslateGemmaNode:
                 }),
                 "truncate_input": ("BOOLEAN", {
                     "default": True,
+                    "advanced": True,
                     "tooltip": "Truncate input if it exceeds max_input_tokens. Disable may cause OOM on long texts.",
                 }),
                 "strict_context_limit": ("BOOLEAN", {
                     "default": True,
+                    "advanced": True,
                     "tooltip": "Clamp output so input+output stays within model context window.",
                 }),
                 "keep_model_loaded": ("BOOLEAN", {
                     "default": True,
+                    "advanced": True,
                     "tooltip": "Keep model in memory between runs for faster repeated use; may keep VRAM allocated.",
                 }),
                 "debug": ("BOOLEAN", {
                     "default": False,
+                    "advanced": True,
                     "tooltip": "Enable debug logging. Sensitive data is redacted by default; set TRANSLATEGEMMA_VERBOSE_DEBUG=1 for full details.",
                 }),
                 "chinese_conversion_only": ("BOOLEAN", {
@@ -381,6 +392,7 @@ class TranslateGemmaNode:
                 }),
                 "long_text_strategy": (["disable", "auto-continue", "segmented"], {
                     "default": "disable",
+                    "advanced": True,
                     "tooltip": (
                         "disable: default single-call behavior.\n"
                         "auto-continue: if the model stops early (<end_of_turn>) on long input, retry up to 2 rounds "
@@ -392,6 +404,7 @@ class TranslateGemmaNode:
                 # TG-014: BitsAndBytes quantization for VRAM reduction
                 "quantization": (list(QUANTIZATION_OPTIONS), {
                     "default": "none",
+                    "advanced": True,
                     "tooltip": (
                         "Best-effort VRAM reduction using bitsandbytes (TG-014).\n"
                         "none: No quantization (default, full precision).\n"
@@ -569,6 +582,7 @@ class TranslateGemmaNode:
 
         return (results,)
 
+    @serialized_model_access
     def _translate_one(
         self,
         text: str,
@@ -1202,15 +1216,16 @@ class TranslateGemmaNode:
 
             return (translated_text,)
         except Exception as e:
-            # TG-008: Include context in inference errors
-            # TG-018: Cleanup on error (even if keep_model_loaded=True)
-            cleanup_torch_memory()
+            # A failed inference may leave the model/device in an unknown state.
+            # Evict even when keep_model_loaded=True so it cannot become a stale hit.
+            unload_current_model()
             raise RuntimeError(f"Translation failed: {e}\n[Context] {inference_context}") from e
         finally:
             # TG-004: Unload model if keep_model_loaded is False
             if not keep_model_loaded:
                 unload_current_model()
 
+    @serialized_model_access
     def _translate_image(
         self,
         image: Any,
@@ -1652,7 +1667,8 @@ class TranslateGemmaNode:
             )
             return (image_result,)
         except Exception as e:
-            cleanup_torch_memory()
+            # Keep error recovery inside the same lifecycle ownership interval.
+            unload_current_model()
             hint = ""
             if source_language == "Auto Detect":
                 hint = (
