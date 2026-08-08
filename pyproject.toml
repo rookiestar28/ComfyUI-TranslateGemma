@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "comfyui-translategemma"
 description = "ComfyUI node for TranslateGemma — Google's open source translation models with 55 languages & multimodal image translation."
-version = "1.2.5"
+version = "1.3.0"
 requires-python = ">=3.12,<3.14"
 license = "MIT"
 license-files = ["LICENSE"]
