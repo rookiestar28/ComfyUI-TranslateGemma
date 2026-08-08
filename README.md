@@ -6,19 +6,43 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
   <img src="assets/TranslateGemma.png" alt="TranslateGemma" />
 </p>
 
- [TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
+[TranslateGemma: A new suite of open translation models](https://blog.google/innovation-and-ai/technology/developers-tools/translategemma/)
 
- ---
+---
 
-**01/2026 update**:
+<details><summary><h2>Latest Updates - Click to expand</h2></summary>
 
-- Added `chinese_conversion_only` + `chinese_conversion_direction` for fast Simplified↔Traditional conversion via OpenCC (no model load).
-- Added `max_new_tokens=0` / `max_input_tokens=0` as **Auto** token budgeting (context-aware).
-- Added `long_text_strategy` (`disable` / `auto-continue` / `segmented`) to mitigate “early stop” on long documents.
-- Added `device` override (`default` / `cpu` / `gpu:N`) aligned with ComfyUI device management when available.
-- Added optional BitsAndBytes quantization (`quantization`: `none` / `bnb-8bit` / `bnb-4bit`) for best-effort VRAM reduction.
-- Added native ComfyUI Node Help for Classic and Vue Nodes, `0 = auto` labels for max token widgets, and importable example workflows.
-- Improved Hugging Face download diagnostics (network/auth/disk hints + retries) and added troubleshooting guidance (proxy/mirror/offline).
+<details>
+
+<summary><strong>Host compatibility and runtime safety improved</strong></summary>
+
+- Hardened remote-code and unsafe-weight opt-ins so ordinary load failures cannot silently widen trust.
+- Improved ComfyUI device-helper compatibility and serialized shared model load/inference/unload ownership.
+- Verified Python 3.12/3.13 across Transformers 4.57 and 5.x compatibility lanes.
+
+</details>
+
+<details>
+
+<summary><strong>Classic, Vue Nodes, and workflow behavior aligned</strong></summary>
+
+- Added host-backed Classic and Vue Nodes checks for native Node Help, labels, and frontend safety.
+- Moved tuning controls behind ComfyUI's native advanced-input UI while preserving essential widgets and linked sockets.
+- Preserved legacy positional workflow values and added named-value compatibility for newer frontend save/restore paths.
+
+</details>
+
+<details>
+
+<summary><strong>Packaging and optional quantization guidance refreshed</strong></summary>
+
+- Synchronized runtime/package version metadata and added verified Python version bounds.
+- Added reproducible package-content checks so runtime assets ship without internal development records.
+- Updated BitsAndBytes guidance to use the official optional install path while keeping the base install independent.
+
+</details>
+
+</details>
 
 ---
 
@@ -31,6 +55,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - [Model Storage Location](#model-storage-location)
   - [Manual / Offline Download (Recommended for Restricted Networks)](#manual--offline-download-recommended-for-restricted-networks)
 - [Node: TranslateGemma](#node-translategemma)
+  - [Essential and Advanced Inputs](#essential-and-advanced-inputs)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
 - [Example Workflows](#example-workflows)
@@ -59,9 +84,17 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - Host-aligned device override: `default`, `cpu`, or `gpu:N` when available
 - Optional BitsAndBytes quantization as a separate install path
 - Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model
-- Native Node Help through ComfyUI's Node Library in both Classic and Vue Nodes, plus example workflows
+- Native Node Help through ComfyUI's Node Library in both Classic and Vue Nodes
+- Native advanced-input controls with seven essential widgets visible by default
+- Importable workflow templates with legacy positional and newer named-value compatibility
 
 ## Installation
+
+Supported runtime:
+
+- Python `>=3.12,<3.14` (Python 3.12 or 3.13)
+- Transformers `>=4.57.0`
+- The PyTorch build supplied and managed by the active ComfyUI installation
 
 ### Option A: ComfyUI-Manager
 
@@ -168,7 +201,8 @@ ComfyUI/
           config.json
           generation_config.json
           model.safetensors.index.json
-          *.safetensors (or pytorch_model*.bin)
+          *.safetensors
+          pytorch_model*.bin (only with the explicit unsafe-weight opt-in)
           tokenizer_config.json
           special_tokens_map.json
           processor_config.json
@@ -182,10 +216,19 @@ ComfyUI/
 Notes:
 - Gated models still require accepting the Gemma/TranslateGemma terms on Hugging Face (do this on the download machine).
 - If you copy an incomplete folder, the node may attempt to resume/download missing files when network allows.
+- Pickle-backed `.bin` weights remain blocked unless `TRANSLATEGEMMA_ALLOW_UNSAFE_WEIGHTS=1` is explicitly set for a reviewed, pinned source. Prefer safetensors.
 
 ## Node: TranslateGemma
 
 Category: `text/translation`
+
+### Essential and Advanced Inputs
+
+ComfyUI shows the seven everyday widgets by default: `text`, `target_language`, `model_size`, `device`, `source_language`, `chinese_conversion_only`, and `chinese_conversion_direction`. The linked `image` and `external_text` sockets also remain available.
+
+Use ComfyUI's native advanced-input action to reveal image tuning, prompt/context limits, model retention, diagnostics, long-text strategy, and quantization controls. Collapsing or expanding this UI changes presentation only; input names, saved values, links, and workflow compatibility remain unchanged.
+
+Advanced widgets: `image_enhance`, `image_resize_mode`, `image_two_pass`, `prompt_mode`, `max_new_tokens`, `max_input_tokens`, `truncate_input`, `strict_context_limit`, `keep_model_loaded`, `debug`, `long_text_strategy`, and `quantization`.
 
 ### Inputs
 
@@ -221,13 +264,15 @@ Category: `text/translation`
 
 ## Example Workflows
 
-Import examples from [`example_workflows/`](example_workflows/):
+ComfyUI can expose the JSON files in [`example_workflows/`](example_workflows/) through its workflow template browser, or you can import them manually:
 
 - [`basic_text_translation.json`](example_workflows/basic_text_translation.json): simple text translation.
 - [`external_text_override_template.json`](example_workflows/external_text_override_template.json): template for connecting an upstream `STRING` to `external_text`.
 - [`chinese_conversion_only.json`](example_workflows/chinese_conversion_only.json): OpenCC Simplified/Traditional conversion without model loading.
 - [`image_translation_explicit_source.json`](example_workflows/image_translation_explicit_source.json): image translation template; connect an `IMAGE` input and keep `source_language` explicit.
 - [`long_text_segmented.json`](example_workflows/long_text_segmented.json): paragraph-by-paragraph long text translation.
+
+The shipped templates retain positional widget values for older frontends and include equivalent named values for newer save/restore paths. They do not require a workflow migration.
 
 ## Usage Notes
 
@@ -258,7 +303,7 @@ If small text is missed, try enabling `image_enhance=true` to apply mild pixel-o
 - `TRANSLATEGEMMA_IMAGE_ENHANCE_SHARPNESS`: sharpness factor (default `1.10`)
 - `TRANSLATEGEMMA_AUTO_MAX_NEW_TOKENS_MAX`: optional hard cap for `max_new_tokens=0` (Auto) to limit long-form outputs. If unset, Auto is only limited by context budget + other safeguards.
 
-When `debug=true`, the node prints the path of the preprocessed temporary PNG and keeps it for inspection.
+When `debug=true`, the node prints a redacted filename for the preprocessed temporary PNG and keeps it for inspection. Set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` only when an exact path is required for local troubleshooting.
 
 Additionally, when `debug=true`, the node saves intermediate images under `debug/`:
 - `resize_mode` + `enhance_mode` prefixed files
@@ -393,6 +438,9 @@ The following are the authoritative default values for node inputs:
 ## Performance Tips
 
 - Leave `keep_model_loaded=true` for repeated use (avoids reload time).
+- Set `keep_model_loaded=false` when memory release after each run is more important than reload latency.
+- Shared model load, inference, switch, and unload operations are serialized to prevent concurrent cache mutation; simultaneous runs may wait for the current model owner.
+- A failed inference evicts the cached model so the next run cannot reuse an uncertain model state.
 - Use the 4B model if you are unsure about hardware limits.
 - First run is slower due to download and weight initialization.
 
