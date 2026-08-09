@@ -2,40 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-	ADVANCED_WIDGET_NAMES,
 	LABEL_FALLBACKS,
-	applyAdvancedWidgetMetadataFallbacks,
 	applyWidgetLabelFallbacks,
 	isTranslateGemmaNode,
 } from "../../web/extensions/translategemma_help_contract.js";
-
-test("repairs the 1.48.x Classic advanced metadata bridge without changing values", () => {
-	const node = legacyNode();
-	node.widgets[0].options.advanced = true;
-	node.widgets[1].options.advanced = true;
-	const beforeNames = node.widgets.map((widget) => widget.name);
-	const beforeValues = node.widgets.map((widget) => widget.value);
-	const beforeOptions = structuredClone(node.widgets.map((widget) => widget.options));
-
-	assert.equal(applyAdvancedWidgetMetadataFallbacks(node), 2);
-	assert.equal(node.widgets[0].advanced, true);
-	assert.equal(node.widgets[1].advanced, true);
-	assert.equal(node.widgets[2].advanced, undefined);
-	assert.deepEqual(node.widgets.map((widget) => widget.name), beforeNames);
-	assert.deepEqual(node.widgets.map((widget) => widget.value), beforeValues);
-	assert.deepEqual(node.widgets.map((widget) => widget.options), beforeOptions);
-	assert.equal(applyAdvancedWidgetMetadataFallbacks(node), 0);
-	assert.ok(ADVANCED_WIDGET_NAMES.includes("max_new_tokens"));
-});
-
-test("advanced bridge accepts only exact backend boolean metadata", () => {
-	const node = legacyNode();
-	node.widgets[0].options.advanced = "true";
-	node.widgets[1].options.advanced = false;
-	assert.equal(applyAdvancedWidgetMetadataFallbacks(node), 0);
-	assert.equal(node.widgets[0].advanced, undefined);
-	assert.equal(node.widgets[1].advanced, undefined);
-});
 
 function legacyNode() {
 	return {

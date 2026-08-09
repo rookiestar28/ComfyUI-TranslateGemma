@@ -4,13 +4,17 @@ import path from "node:path";
 
 const NODE_NAME = "TranslateGemma";
 const VUE_SETTING = "Comfy.VueNodes.Enabled";
-const ADVANCED_SETTING = "Comfy.Node.AlwaysShowAdvancedWidgets";
 const FRONTEND_VERSION = process.env.COMFYUI_TEST_FRONTEND_VERSION;
-const ARTIFACT_DIR = path.resolve("output", "playwright", "tg064");
-const ADVANCED = [
+const ARTIFACT_DIR = path.resolve("output", "playwright", "tg065");
+const VISIBLE_WIDGETS = [
+	"text",
+	"target_language",
+	"model_size",
+	"device",
 	"image_enhance",
 	"image_resize_mode",
 	"image_two_pass",
+	"source_language",
 	"prompt_mode",
 	"max_new_tokens",
 	"max_input_tokens",
@@ -18,17 +22,10 @@ const ADVANCED = [
 	"strict_context_limit",
 	"keep_model_loaded",
 	"debug",
-	"long_text_strategy",
-	"quantization",
-];
-const VISIBLE_WIDGETS = [
-	"text",
-	"target_language",
-	"model_size",
-	"device",
-	"source_language",
 	"chinese_conversion_only",
 	"chinese_conversion_direction",
+	"long_text_strategy",
+	"quantization",
 ];
 const FORBIDDEN_EVIDENCE = [
 	"HF_TOKEN",
@@ -102,24 +99,6 @@ async function installEvidenceGraph(page) {
 	return installed;
 }
 
-async function routePreChangeObjectInfo(page) {
-	const handler = async (route) => {
-		const response = await route.fetch();
-		const body = await response.json();
-		const node = body[NODE_NAME];
-		if (node) {
-			for (const section of ["required", "optional"]) {
-				for (const spec of Object.values(node.input?.[section] ?? {})) {
-					if (Array.isArray(spec) && spec[1]) delete spec[1].advanced;
-				}
-			}
-		}
-		await route.fulfill({ response, json: body });
-	};
-	await page.route("**/api/object_info*", handler);
-	return handler;
-}
-
 async function openEphemeralBlankWorkflow(page) {
 	const create = page.getByRole("button", { name: "Create a new blank workflow" });
 	await expect(create).toBeVisible();
@@ -140,7 +119,6 @@ async function inspectNode(page) {
 				.map((widget) => widget.name),
 			values: node.widgets.map((widget) => widget.value),
 			serialized: node.serialize().widgets_values,
-			showAdvanced: Boolean(node.showAdvanced),
 		};
 	});
 }
@@ -194,23 +172,9 @@ async function screenshotEvidenceNode(page, name, vue) {
 		await expect(node).toBeVisible();
 		const bodyBox = await node.boundingBox();
 		if (!bodyBox) throw new Error("Vue node body has no screenshot bounds.");
-		const advancedButton = page.getByTestId("advanced-inputs-button");
-		const buttonBox = (await advancedButton.isVisible())
-			? await advancedButton.boundingBox()
-			: null;
-		const x = Math.min(bodyBox.x, buttonBox?.x ?? bodyBox.x);
-		const y = Math.min(bodyBox.y, buttonBox?.y ?? bodyBox.y);
-		const right = Math.max(
-			bodyBox.x + bodyBox.width,
-			buttonBox ? buttonBox.x + buttonBox.width : bodyBox.x + bodyBox.width
-		);
-		const bottom = Math.max(
-			bodyBox.y + bodyBox.height,
-			buttonBox ? buttonBox.y + buttonBox.height : bodyBox.y + bodyBox.height
-		);
 		await page.screenshot({
 			path: path.join(ARTIFACT_DIR, name),
-			clip: { x, y, width: right - x, height: bottom - y },
+			clip: bodyBox,
 		});
 		return;
 	}
@@ -234,7 +198,7 @@ async function screenshotEvidenceNode(page, name, vue) {
 	await page.screenshot({ path: path.join(ARTIFACT_DIR, name), clip });
 }
 
-async function addAdvancedLink(page) {
+async function addWidgetLink(page) {
 	return page.evaluate(() => {
 		const app = globalThis.comfyAPI.app.app;
 		const target = app.graph._nodes.find((item) => item.type === "TranslateGemma");
@@ -247,7 +211,7 @@ async function addAdvancedLink(page) {
 		);
 		if (targetSlot < 0) throw new Error("max_new_tokens input slot is unavailable.");
 		const link = source.connect(0, target, targetSlot);
-		if (!link) throw new Error("Advanced widget link was rejected.");
+		if (!link) throw new Error("Widget link was rejected.");
 		return { sourceId: String(source.id), targetSlot };
 	});
 }
@@ -275,7 +239,7 @@ for (const renderer of [
 	{ name: "Classic", slug: "classic", vue: false },
 	{ name: "Vue", slug: "vue", vue: true },
 ]) {
-	test(`host-native advanced input UX works in ${renderer.name}`, async ({ page, request }) => {
+	test(`all established inputs are visible by default in ${renderer.name}`, async ({ page, request }) => {
 		test.setTimeout(180_000);
 		const writes = [];
 		page.on("request", (outgoing) => {
@@ -301,34 +265,21 @@ for (const renderer of [
 		);
 		const originalSettings = {
 			[VUE_SETTING]: await getSetting(page, VUE_SETTING),
-			[ADVANCED_SETTING]: await getSetting(page, ADVANCED_SETTING),
 		};
 
 		let failure;
 		try {
 			await mkdir(ARTIFACT_DIR, { recursive: true });
 			await setSetting(page, VUE_SETTING, renderer.vue);
-			await setSetting(page, ADVANCED_SETTING, false);
-			const baselineRoute = await routePreChangeObjectInfo(page);
-			await reloadReady(page);
-			await openEphemeralBlankWorkflow(page);
-			await installEvidenceGraph(page);
-			await screenshotEvidenceNode(
-				page,
-				`${renderer.slug}-pre-change-baseline.png`,
-				renderer.vue
-			);
-			await page.unroute("**/api/object_info*", baselineRoute);
 			await reloadReady(page);
 			await openEphemeralBlankWorkflow(page);
 			await installEvidenceGraph(page);
 
-			expect(actualAdvanced).toEqual(ADVANCED);
-			const collapsed = await inspectNode(page);
-			expect(collapsed.advanced).toEqual(ADVANCED);
-			expect(collapsed.visible).toEqual(VISIBLE_WIDGETS);
-			expect(collapsed.showAdvanced).toBe(false);
-			await screenshotEvidenceNode(page, `${renderer.slug}-collapsed.png`, renderer.vue);
+			expect(actualAdvanced).toEqual([]);
+			const initial = await inspectNode(page);
+			expect(initial.advanced).toEqual([]);
+			expect(initial.visible).toEqual(VISIBLE_WIDGETS);
+			await screenshotEvidenceNode(page, `${renderer.slug}-default-visible.png`, renderer.vue);
 
 			if (renderer.vue) {
 				const nodeId = await page.evaluate(() =>
@@ -340,9 +291,7 @@ for (const renderer of [
 				);
 				const node = page.locator(`[data-testid="node-body-${nodeId}"]`);
 				const advancedButton = page.getByTestId("advanced-inputs-button");
-				await expect(advancedButton).toBeVisible();
-				await expect(advancedButton).toContainText(/show advanced(?: inputs)?/i);
-				await advancedButton.click();
+				await expect(advancedButton).toBeHidden();
 				const tokenControl = node.getByLabel("max_new_tokens", { exact: true });
 				await expect(tokenControl).toBeVisible();
 				await tokenControl.click();
@@ -355,32 +304,21 @@ for (const renderer of [
 					const node = globalThis.comfyAPI.app.app.graph._nodes.find(
 						(item) => item.type === "TranslateGemma"
 					);
-					node.toggleAdvanced();
 					const widget = node.widgets.find((item) => item.name === "max_new_tokens");
 					widget.value = 640;
 					widget.callback?.(640, globalThis.comfyAPI.app.app.canvas, node, [0, 0], null);
 				});
 			}
 
-			const expanded = await inspectNode(page);
-			expect(expanded.showAdvanced).toBe(true);
-			expect(expanded.visible).toEqual([...VISIBLE_WIDGETS.slice(0, 4), ...ADVANCED.slice(0, 3), VISIBLE_WIDGETS[4], ...ADVANCED.slice(3, 10), ...VISIBLE_WIDGETS.slice(5), ...ADVANCED.slice(10)]);
-			expect(expanded.values[9]).toBe(640);
-			await screenshotEvidenceNode(page, `${renderer.slug}-expanded.png`, renderer.vue);
+			const edited = await inspectNode(page);
+			expect(edited.visible).toEqual(VISIBLE_WIDGETS);
+			expect(edited.values[9]).toBe(640);
 
-			await addAdvancedLink(page);
+			await addWidgetLink(page);
 			await assertLinkOperable(page);
-			await page.evaluate(() => {
-				const node = globalThis.comfyAPI.app.app.graph._nodes.find(
-					(item) => item.type === "TranslateGemma"
-				);
-				node.toggleAdvanced();
-			});
-			await assertLinkOperable(page);
-
-			const afterCollapse = await inspectNode(page);
-			expect(afterCollapse.showAdvanced).toBe(false);
-			expect(afterCollapse.serialized[9]).toBe(640);
+			const afterLink = await inspectNode(page);
+			expect(afterLink.visible).toContain("max_new_tokens");
+			expect(afterLink.serialized[9]).toBe(640);
 			if (renderer.vue) {
 				const linkedVisible = page.getByLabel("max_new_tokens", { exact: true });
 				await expect(linkedVisible).toBeVisible();

@@ -27,20 +27,6 @@ EXPECTED_OPTIONAL = (
     "long_text_strategy",
     "quantization",
 )
-EXPECTED_ADVANCED = {
-    "image_enhance",
-    "image_resize_mode",
-    "image_two_pass",
-    "prompt_mode",
-    "max_new_tokens",
-    "max_input_tokens",
-    "truncate_input",
-    "strict_context_limit",
-    "keep_model_loaded",
-    "debug",
-    "long_text_strategy",
-    "quantization",
-}
 EXPECTED_SCHEMA_WITHOUT_ADVANCED_SHA256 = (
     "ada2dbaf072e3ded31a43d2eee53f58c34c058a07210895db4b1124235886126"  # pragma: allowlist secret
 )
@@ -96,8 +82,8 @@ class _StripAdvanced(ast.NodeTransformer):
         return node
 
 
-class AdvancedInputMetadataTests(unittest.TestCase):
-    def test_exact_component_classification_uses_boolean_true(self):
+class InputVisibilityCompatibilityTests(unittest.TestCase):
+    def test_exact_component_contract_has_no_advanced_metadata(self):
         sections = _schema_sections()
         self.assertEqual(tuple(sections["required"]), EXPECTED_REQUIRED)
         self.assertEqual(tuple(sections["optional"]), EXPECTED_OPTIONAL)
@@ -108,30 +94,22 @@ class AdvancedInputMetadataTests(unittest.TestCase):
                 options = _option_dict(spec)
                 if "advanced" not in options:
                     continue
-                self.assertIsInstance(options["advanced"], ast.Constant, name)
-                self.assertIs(options["advanced"].value, True, name)
                 actual_advanced.add(name)
 
-        self.assertEqual(actual_advanced, EXPECTED_ADVANCED)
+        self.assertEqual(actual_advanced, set())
 
-    def test_essential_widgets_and_force_link_sockets_are_not_advanced(self):
+    def test_all_widgets_and_force_link_sockets_are_not_advanced(self):
         sections = _schema_sections()
-        essential = {
-            *EXPECTED_REQUIRED,
-            "source_language",
-            "chinese_conversion_only",
-            "chinese_conversion_direction",
-        }
-        for name in essential:
-            section = "required" if name in EXPECTED_REQUIRED else "optional"
-            self.assertNotIn("advanced", _option_dict(sections[section][name]), name)
+        for section in sections.values():
+            for name, spec in section.items():
+                self.assertNotIn("advanced", _option_dict(spec), name)
 
         for name in ("image", "external_text"):
             options = _option_dict(sections["optional"][name])
             self.assertNotIn("advanced", options, name)
             self.assertIs(options["forceInput"].value, True, name)
 
-    def test_every_non_advanced_schema_detail_is_frozen(self):
+    def test_complete_default_visible_schema_is_frozen(self):
         schema = _StripAdvanced().visit(_input_schema_ast())
         normalized = ast.dump(
             ast.fix_missing_locations(schema),

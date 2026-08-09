@@ -314,17 +314,14 @@ class TranslateGemmaNode:
                 }),
                 "image_enhance": ("BOOLEAN", {
                     "default": False,
-                    "advanced": True,
                     "tooltip": "Mild contrast/sharpening to help small text visibility; may introduce artifacts on some images.",
                 }),
                 "image_resize_mode": (["letterbox", "processor", "stretch"], {
                     "default": "letterbox",
-                    "advanced": True,
                     "tooltip": "letterbox: preserve aspect ratio (pad to 896×896, recommended). processor: official resize (may stretch). stretch: force 896×896 (may distort).",
                 }),
                 "image_two_pass": ("BOOLEAN", {
                     "default": True,
-                    "advanced": True,
                     "tooltip": "Extract text from image first (source→source), then translate extracted text (more accurate, slower).",
                 }),
                 "source_language": (["Auto Detect"] + languages, {
@@ -337,12 +334,10 @@ class TranslateGemmaNode:
                 }),
                 "prompt_mode": (prompt_modes, {
                     "default": "auto",
-                    "advanced": True,
                     "tooltip": "auto: structured first, fallback to plain. structured: fail loudly if chat template unavailable. plain: instruction-only (no chat template).",
                 }),
                 "max_new_tokens": ("INT", {
                     "default": 512,
-                    "advanced": True,
                     "min": 0,
                     "max": 8192,
                     "step": 16,
@@ -354,7 +349,6 @@ class TranslateGemmaNode:
                 }),
                 "max_input_tokens": ("INT", {
                     "default": 2048,
-                    "advanced": True,
                     "min": 0,
                     "max": 8192,
                     "step": 64,
@@ -364,22 +358,18 @@ class TranslateGemmaNode:
                 }),
                 "truncate_input": ("BOOLEAN", {
                     "default": True,
-                    "advanced": True,
                     "tooltip": "Truncate input if it exceeds max_input_tokens. Disable may cause OOM on long texts.",
                 }),
                 "strict_context_limit": ("BOOLEAN", {
                     "default": True,
-                    "advanced": True,
                     "tooltip": "Clamp output so input+output stays within model context window.",
                 }),
                 "keep_model_loaded": ("BOOLEAN", {
                     "default": True,
-                    "advanced": True,
                     "tooltip": "Keep model in memory between runs for faster repeated use; may keep VRAM allocated.",
                 }),
                 "debug": ("BOOLEAN", {
                     "default": False,
-                    "advanced": True,
                     "tooltip": "Enable debug logging. Sensitive data is redacted by default; set TRANSLATEGEMMA_VERBOSE_DEBUG=1 for full details.",
                 }),
                 "chinese_conversion_only": ("BOOLEAN", {
@@ -392,7 +382,6 @@ class TranslateGemmaNode:
                 }),
                 "long_text_strategy": (["disable", "auto-continue", "segmented"], {
                     "default": "disable",
-                    "advanced": True,
                     "tooltip": (
                         "disable: default single-call behavior.\n"
                         "auto-continue: if the model stops early (<end_of_turn>) on long input, retry up to 2 rounds "
@@ -404,7 +393,6 @@ class TranslateGemmaNode:
                 # TG-014: BitsAndBytes quantization for VRAM reduction
                 "quantization": (list(QUANTIZATION_OPTIONS), {
                     "default": "none",
-                    "advanced": True,
                     "tooltip": (
                         "Best-effort VRAM reduction using bitsandbytes (TG-014).\n"
                         "none: No quantization (default, full precision).\n"

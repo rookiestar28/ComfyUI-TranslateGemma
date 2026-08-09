@@ -5,23 +5,6 @@ export const LABEL_FALLBACKS = Object.freeze({
 	max_input_tokens: "max_input_tokens (0 = auto)",
 });
 
-export const ADVANCED_WIDGET_NAMES = Object.freeze([
-	"image_enhance",
-	"image_resize_mode",
-	"image_two_pass",
-	"prompt_mode",
-	"max_new_tokens",
-	"max_input_tokens",
-	"truncate_input",
-	"strict_context_limit",
-	"keep_model_loaded",
-	"debug",
-	"long_text_strategy",
-	"quantization",
-]);
-
-const ADVANCED_WIDGET_NAME_SET = new Set(ADVANCED_WIDGET_NAMES);
-
 export function isTranslateGemmaNode(node) {
 	const nodeName =
 		node?.comfyClass ??
@@ -79,21 +62,5 @@ export function applyWidgetLabelFallbacks(node) {
 		changed += 1;
 	}
 
-	return changed;
-}
-
-export function applyAdvancedWidgetMetadataFallbacks(node) {
-	if (!Array.isArray(node?.widgets)) return 0;
-
-	let changed = 0;
-	for (const widget of node.widgets) {
-		if (!ADVANCED_WIDGET_NAME_SET.has(widget?.name)) continue;
-		if (widget.options?.advanced !== true || widget.advanced === true) continue;
-
-		// IMPORTANT: frontend 1.48.x stores backend metadata in options, while
-		// Classic LiteGraph reads the native widget property directly.
-		widget.advanced = true;
-		changed += 1;
-	}
 	return changed;
 }

@@ -2,7 +2,6 @@
 // parent traversals are required to reach ComfyUI's application module.
 import { app } from "../../../scripts/app.js";
 import {
-	applyAdvancedWidgetMetadataFallbacks,
 	applyWidgetLabelFallbacks,
 	isTranslateGemmaNode,
 } from "./translategemma_help_contract.js";
@@ -17,6 +16,5 @@ app.registerExtension({
 		// IMPORTANT: keep this per-instance hook renderer-independent. Canvas
 		// prototype draw/mouse patches are not invoked by ComfyUI Vue Nodes.
 		applyWidgetLabelFallbacks(node);
-		applyAdvancedWidgetMetadataFallbacks(node);
 	},
 });

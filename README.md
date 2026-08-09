@@ -27,7 +27,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 <summary><strong>Classic, Vue Nodes, and workflow behavior aligned</strong></summary>
 
 - Added host-backed Classic and Vue Nodes checks for native ComfyUI Node Help, labels, and frontend safety.
-- Moved tuning controls behind ComfyUI's native advanced-input UI while preserving essential widgets and linked sockets.
+- Restored all established controls to default visibility after the advanced-input presentation made parameters appear missing in Classic Nodes.
 - Preserved legacy positional workflow values and added named-value compatibility for newer frontend save/restore paths.
 
 </details>
@@ -55,7 +55,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - [Model Storage Location](#model-storage-location)
   - [Manual / Offline Download (Recommended for Restricted Networks)](#manual--offline-download-recommended-for-restricted-networks)
 - [Node: TranslateGemma](#node-translategemma)
-  - [Essential and Advanced Inputs](#essential-and-advanced-inputs)
+  - [Input Visibility](#input-visibility)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
 - [Example Workflows](#example-workflows)
@@ -85,7 +85,7 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 - Optional BitsAndBytes quantization as a separate install path
 - Chinese conversion-only mode: Simplified↔Traditional conversion via OpenCC without loading the model
 - Native Node Help through ComfyUI's Node Library in both Classic and Vue Nodes
-- Native advanced-input controls with seven essential widgets visible by default
+- All established controls visible by default in Classic and Vue Nodes
 - Importable workflow templates with legacy positional and newer named-value compatibility
 
 ## Installation
@@ -222,13 +222,9 @@ Notes:
 
 Category: `text/translation`
 
-### Essential and Advanced Inputs
+### Input Visibility
 
-ComfyUI shows the seven everyday widgets by default: `text`, `target_language`, `model_size`, `device`, `source_language`, `chinese_conversion_only`, and `chinese_conversion_direction`. The linked `image` and `external_text` sockets also remain available.
-
-Use ComfyUI's native advanced-input action to reveal image tuning, prompt/context limits, model retention, diagnostics, long-text strategy, and quantization controls. Collapsing or expanding this UI changes presentation only; input names, saved values, links, and workflow compatibility remain unchanged.
-
-Advanced widgets: `image_enhance`, `image_resize_mode`, `image_two_pass`, `prompt_mode`, `max_new_tokens`, `max_input_tokens`, `truncate_input`, `strict_context_limit`, `keep_model_loaded`, `debug`, `long_text_strategy`, and `quantization`.
+All established controls are visible when the node is created in Classic or Vue Nodes. The `image` and `external_text` link sockets remain available, and existing positional and named workflow values continue to load without migration.
 
 ### Inputs
 

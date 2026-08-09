@@ -3,10 +3,15 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
-const ADVANCED = [
+const WIDGETS = [
+	"text",
+	"target_language",
+	"model_size",
+	"device",
 	"image_enhance",
 	"image_resize_mode",
 	"image_two_pass",
+	"source_language",
 	"prompt_mode",
 	"max_new_tokens",
 	"max_input_tokens",
@@ -14,17 +19,10 @@ const ADVANCED = [
 	"strict_context_limit",
 	"keep_model_loaded",
 	"debug",
-	"long_text_strategy",
-	"quantization",
-];
-const ESSENTIAL = [
-	"text",
-	"target_language",
-	"model_size",
-	"device",
-	"source_language",
 	"chinese_conversion_only",
 	"chinese_conversion_direction",
+	"long_text_strategy",
+	"quantization",
 ];
 const SOCKETS = ["image", "external_text"];
 
@@ -36,27 +34,22 @@ function inputBlock(source, name) {
 	return source.slice(start, next === -1 ? source.length : next);
 }
 
-test("source declares only the planned host-native advanced inputs", async () => {
+test("source keeps every established widget visible without advanced metadata", async () => {
 	const source = await readFile(path.resolve("nodes", "translate_node.py"), "utf8");
-	for (const name of ADVANCED) {
-		assert.match(inputBlock(source, name), /"advanced": True,/u, name);
-	}
-	for (const name of [...ESSENTIAL, ...SOCKETS]) {
+	for (const name of [...WIDGETS, ...SOCKETS]) {
 		assert.doesNotMatch(inputBlock(source, name), /"advanced"\s*:/u, name);
 	}
-	assert.equal((source.match(/"advanced": True,/gu) ?? []).length, ADVANCED.length);
+	assert.equal((source.match(/"advanced"\s*:/gu) ?? []).length, 0);
 });
 
-test("native visibility semantics retain linked advanced widgets", () => {
-	const visible = ({ hidden = false, advanced = false }, showAdvanced, linked = false) =>
-		!hidden && (!advanced || showAdvanced || linked);
-	assert.equal(visible({ advanced: true }, false), false);
-	assert.equal(visible({ advanced: true }, true), true);
-	assert.equal(visible({ advanced: true }, false, true), true);
-	assert.equal(visible({ advanced: true, hidden: true }, true, true), false);
+test("default visibility is independent of renderer advanced state", () => {
+	const visible = ({ hidden = false, advanced = false }) => !hidden && !advanced;
+	for (const name of WIDGETS) {
+		assert.equal(visible({ name }), true, name);
+	}
 });
 
-test("advanced editor state never changes positional or named workflow values", async () => {
+test("restored visibility preserves positional and named workflow values", async () => {
 	const raw = await readFile(
 		path.resolve("example_workflows", "basic_text_translation.json"),
 		"utf8"
@@ -64,8 +57,6 @@ test("advanced editor state never changes positional or named workflow values", 
 	const node = JSON.parse(raw).nodes[0];
 	const beforeArray = structuredClone(node.widgets_values);
 	const beforeNamed = structuredClone(node.widgets_values_named);
-	node.showAdvanced = false;
-	node.showAdvanced = true;
 	assert.deepEqual(node.widgets_values, beforeArray);
 	assert.deepEqual(node.widgets_values_named, beforeNamed);
 	assert.equal(node.type, "TranslateGemma");
