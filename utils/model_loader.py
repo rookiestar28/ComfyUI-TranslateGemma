@@ -244,31 +244,89 @@ def _load_pretrained_with_security_policy(
 
 def get_model_dir() -> str:
     """
-    Get the base directory for TranslateGemma models.
-    
-    Uses structured path: ComfyUI/models/LLM/TranslateGemma/ if LLM exists,
-    otherwise ComfyUI/models/translate_gemma/
-    
+    Return the default base directory for TranslateGemma models without creating it.
+
+    Registered ComfyUI ``LLM`` roots are already ordered by the host, including
+    any ``is_default`` promotion. When none are registered, retain the existing
+    canonical/legacy destination rule beneath ``folder_paths.models_dir``.
+
     Returns:
         Base directory path for model storage
     """
-    models_dir = folder_paths.models_dir
-    
-    # Try LLM folder first (preferred)
-    llm_dir = os.path.join(models_dir, "LLM", "TranslateGemma")
-    if os.path.exists(os.path.join(models_dir, "LLM")) or not os.path.exists(os.path.join(models_dir, "translate_gemma")):
-        os.makedirs(llm_dir, exist_ok=True)
-        return llm_dir
-    
-    # Fallback to translate_gemma
-    translate_dir = os.path.join(models_dir, "translate_gemma")
-    os.makedirs(translate_dir, exist_ok=True)
-    return translate_dir
+    registered_roots = _get_registered_llm_roots()
+    if registered_roots:
+        return os.path.join(registered_roots[0], "TranslateGemma")
+    return _get_unregistered_default_model_dir()
+
+
+def _normalize_model_base(path: str) -> tuple[str, str]:
+    """Return an absolute base path and its platform-aware deduplication key."""
+    normalized = os.path.abspath(os.path.normpath(path))
+    return normalized, os.path.normcase(normalized)
+
+
+def _get_registered_llm_roots() -> list[str]:
+    """Read ComfyUI's ordered ``LLM`` roots without mutating host registration."""
+    get_folder_paths = getattr(folder_paths, "get_folder_paths", None)
+    if not callable(get_folder_paths):
+        return []
+
+    try:
+        configured_roots = get_folder_paths("LLM")
+    except KeyError:
+        return []
+    except Exception:
+        raise RuntimeError(
+            "Unable to read ComfyUI registered LLM model paths. Check the host's "
+            "extra model path configuration."
+        ) from None
+
+    if not isinstance(configured_roots, (list, tuple)):
+        raise RuntimeError("ComfyUI registered LLM model paths must be an ordered list.")
+
+    roots = []
+    seen = set()
+    for configured_root in configured_roots:
+        if not isinstance(configured_root, str) or not configured_root.strip():
+            raise RuntimeError("ComfyUI registered LLM model paths contain an invalid entry.")
+        normalized, key = _normalize_model_base(configured_root)
+        if key not in seen:
+            seen.add(key)
+            roots.append(normalized)
+    return roots
+
+
+def _get_unregistered_default_model_dir() -> str:
+    models_dir, _ = _normalize_model_base(folder_paths.models_dir)
+    llm_root = os.path.join(models_dir, "LLM")
+    canonical = os.path.join(llm_root, "TranslateGemma")
+    legacy = os.path.join(models_dir, "translate_gemma")
+    if os.path.exists(llm_root) or not os.path.exists(legacy):
+        return canonical
+    return legacy
+
+
+def _get_model_base_candidates(registered_roots: list[str]) -> list[str]:
+    """Build ordered read candidates while preserving first occurrence."""
+    models_dir, _ = _normalize_model_base(folder_paths.models_dir)
+    raw_candidates = [
+        *(os.path.join(root, "TranslateGemma") for root in registered_roots),
+        os.path.join(models_dir, "LLM", "TranslateGemma"),
+        os.path.join(models_dir, "translate_gemma"),
+    ]
+    candidates = []
+    seen = set()
+    for candidate in raw_candidates:
+        normalized, key = _normalize_model_base(candidate)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(normalized)
+    return candidates
 
 
 def get_model_path(repo_id: str) -> str:
     """
-    Get the local cache path for a specific model repo (TG-005: isolated per repo).
+    Resolve the local path for a specific model repo without creating directories.
     
     Args:
         repo_id: HuggingFace repo ID (e.g., "google/translategemma-4b-it")
@@ -276,12 +334,28 @@ def get_model_path(repo_id: str) -> str:
     Returns:
         Directory path for this specific model
     """
-    base_dir = get_model_dir()
-    # Convert repo_id to safe directory name (e.g., google/translategemma-4b-it -> translategemma-4b-it)
-    repo_name = repo_id.split("/")[-1]
-    model_dir = os.path.join(base_dir, repo_name)
-    os.makedirs(model_dir, exist_ok=True)
-    return model_dir
+    repo_name = repo_id.rsplit("/", 1)[-1]
+    if not repo_name or repo_name in {".", ".."} or os.path.basename(repo_name) != repo_name:
+        raise ValueError("Invalid model repository identifier.")
+
+    registered_roots = _get_registered_llm_roots()
+    base_candidates = _get_model_base_candidates(registered_roots)
+
+    # IMPORTANT: search every root for the requested complete snapshot before
+    # choosing a download destination; eager selection can pick another model
+    # size or write a duplicate model onto the wrong disk.
+    for base_dir in base_candidates:
+        candidate = os.path.join(base_dir, repo_name)
+        is_complete, _ = _is_snapshot_complete(candidate, debug=False)
+        if is_complete:
+            return candidate
+
+    default_base = (
+        os.path.join(registered_roots[0], "TranslateGemma")
+        if registered_roots
+        else _get_unregistered_default_model_dir()
+    )
+    return os.path.join(default_base, repo_name)
 
 
 def _get_comfy_model_management():
@@ -618,6 +692,55 @@ def _weights_present(local_dir: str) -> bool:
     return False
 
 
+def _weight_index_missing_entries(local_dir: str, index_filename: str) -> list[str]:
+    """Validate an atomic local shard index without exposing filesystem paths."""
+    import json
+
+    index_path = os.path.join(local_dir, index_filename)
+    try:
+        with open(index_path, "r", encoding="utf-8") as index_file:
+            index_data = json.load(index_file)
+    except (json.JSONDecodeError, OSError) as error:
+        return [f"{index_filename} (parse error: {type(error).__name__})"]
+
+    if not isinstance(index_data, dict):
+        return [f"{index_filename} (expected an object)"]
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        return [f"{index_filename} (weight_map must be a non-empty object)"]
+
+    local_root = os.path.abspath(local_dir)
+    shard_files = set()
+    for tensor_name, shard in weight_map.items():
+        if (
+            not isinstance(tensor_name, str)
+            or not tensor_name
+            or not isinstance(shard, str)
+            or not shard
+        ):
+            return [f"{index_filename} (invalid weight_map entry)"]
+        normalized_shard = os.path.normpath(shard)
+        if (
+            os.path.isabs(shard)
+            or normalized_shard in {".", ".."}
+            or normalized_shard.startswith(".." + os.sep)
+        ):
+            return [f"{index_filename} (invalid shard path)"]
+        shard_path = os.path.abspath(os.path.join(local_root, normalized_shard))
+        try:
+            if os.path.commonpath((local_root, shard_path)) != local_root:
+                return [f"{index_filename} (invalid shard path)"]
+        except ValueError:
+            return [f"{index_filename} (invalid shard path)"]
+        shard_files.add((shard, shard_path))
+
+    return [
+        f"shard: {name}"
+        for name, path in sorted(shard_files)
+        if not os.path.isfile(path)
+    ]
+
+
 def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, list[str]]:
     """
     Check if model snapshot in local_dir is complete (TG-027).
@@ -635,8 +758,6 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
     Returns:
         Tuple of (is_complete, missing_files_list)
     """
-    import json
-    
     if not os.path.isdir(local_dir):
         return False, ["directory does not exist"]
     
@@ -655,7 +776,7 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
     ]
 
     for f in required_metadata:
-        if not os.path.exists(os.path.join(local_dir, f)):
+        if not os.path.isfile(os.path.join(local_dir, f)):
             missing.append(f)
 
     # Tokenizer vocabulary/model artifact (name varies by tokenizer implementation).
@@ -666,7 +787,7 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
         "sentencepiece.bpe.model",
     ]
     tokenizer_artifact_found = any(
-        os.path.exists(os.path.join(local_dir, f)) for f in tokenizer_artifacts_any
+        os.path.isfile(os.path.join(local_dir, f)) for f in tokenizer_artifacts_any
     )
     if not tokenizer_artifact_found:
         missing.append("tokenizer artifact (any of: " + ", ".join(tokenizer_artifacts_any) + ")")
@@ -674,47 +795,23 @@ def _is_snapshot_complete(local_dir: str, debug: bool = False) -> tuple[bool, li
     # 2. Check weights completeness
     index_file = os.path.join(local_dir, "model.safetensors.index.json")
     
-    if os.path.exists(index_file):
-        # Sharded weights: parse index and verify all shards
-        try:
-            with open(index_file, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
-            
-            weight_map = index_data.get("weight_map", {})
-            shard_files = set(weight_map.values())
-            
-            for shard in shard_files:
-                shard_path = os.path.join(local_dir, shard)
-                if not os.path.exists(shard_path):
-                    missing.append(f"shard: {shard}")
-            
-            if debug and shard_files:
-                print(f"[TranslateGemma] Checking {len(shard_files)} shards from index")
-                
-        except (json.JSONDecodeError, KeyError, IOError) as e:
-            missing.append(
-                f"model.safetensors.index.json (parse error: {type(e).__name__})"
-            )
+    if os.path.isfile(index_file):
+        missing.extend(
+            _weight_index_missing_entries(local_dir, "model.safetensors.index.json")
+        )
     else:
         # Single-file weights
         single_weight_files = ["model.safetensors", "pytorch_model.bin"]
         weight_found = any(
-            os.path.exists(os.path.join(local_dir, f)) for f in single_weight_files
+            os.path.isfile(os.path.join(local_dir, f)) for f in single_weight_files
         )
         if not weight_found:
             # Also check for sharded bin files
             bin_index = os.path.join(local_dir, "pytorch_model.bin.index.json")
-            if os.path.exists(bin_index):
-                try:
-                    with open(bin_index, "r", encoding="utf-8") as f:
-                        index_data = json.load(f)
-                    weight_map = index_data.get("weight_map", {})
-                    shard_files = set(weight_map.values())
-                    for shard in shard_files:
-                        if not os.path.exists(os.path.join(local_dir, shard)):
-                            missing.append(f"shard: {shard}")
-                except Exception:
-                    missing.append("weights (no valid weight files found)")
+            if os.path.isfile(bin_index):
+                missing.extend(
+                    _weight_index_missing_entries(local_dir, "pytorch_model.bin.index.json")
+                )
             else:
                 missing.append("weights (expected model.safetensors or pytorch_model.bin)")
     
@@ -772,7 +869,15 @@ def ensure_model_downloaded(
             "(e.g. tokenizer_config.json, special_tokens_map.json, processor_config.json, "
             "preprocessor_config.json, and a tokenizer model/json file)."
         )
-    
+
+    try:
+        os.makedirs(local_dir, exist_ok=True)
+    except OSError:
+        raise RuntimeError(
+            "Unable to create the configured model download destination. Configure a writable "
+            "default LLM root in ComfyUI and retry. No alternate model root was selected."
+        ) from None
+
     # Try huggingface_hub.snapshot_download
     try:
         from huggingface_hub import snapshot_download

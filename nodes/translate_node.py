@@ -73,6 +73,23 @@ from ..utils.truncation_compat import (
 # Use tokenizer_truncation_side(...) / build_structured_inputs_with_truncation(...)
 # to avoid duplicate locks with inconsistent synchronization.
 
+
+def _get_model_cache_context(repo_id: str) -> str:
+    """Resolve a redacted, side-effect-free cache label for secondary error context."""
+    if repo_id == "unknown":
+        return "unknown"
+    if not is_verbose_debug():
+        # Normal diagnostics reveal only the public repo basename and avoid
+        # re-scanning shared/network roots on every successful inference.
+        return repo_id.rsplit("/", 1)[-1]
+    try:
+        return redact_path(get_model_path(repo_id))
+    except Exception:
+        # IMPORTANT: cache-path diagnostics must never replace the original
+        # inference failure or disclose a malformed/private host path.
+        return "unavailable"
+
+
 def _clamp_int(value: int, min_val: int, max_val: int) -> int:
     return max(min_val, min(max_val, int(value)))
 
@@ -1002,7 +1019,7 @@ class TranslateGemmaNode:
         # Build context for error messages (TG-008)
         # Include repo_id/device/dtype/cache_dir as per TG-008 requirements
         repo_id = MODEL_REPOS.get(model_size) or "unknown"
-        cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
+        cache_dir = _get_model_cache_context(repo_id)
         inference_context = (
             f"model_size: {model_size} | repo_id: {repo_id} | "
             f"device_override: {device} | resolved_device: {resolved_device} | "
@@ -1340,7 +1357,7 @@ class TranslateGemmaNode:
         repo_id = MODEL_REPOS.get(model_size) or "unknown"
         resolved_device = get_device(device)
         dtype = get_torch_dtype(resolved_device)
-        cache_dir = get_model_path(repo_id) if repo_id != "unknown" else "unknown"
+        cache_dir = _get_model_cache_context(repo_id)
         inference_context = (
             f"mode: image | model_size: {model_size} | repo_id: {repo_id} | "
             f"device_override: {device} | resolved_device: {resolved_device} | "
@@ -1362,7 +1379,7 @@ class TranslateGemmaNode:
                     f"Image translation requires processor.apply_chat_template, which is missing.\n\n"
                     f"This usually means your transformers version is too old.\n"
                     f"Recommended: transformers>=4.57\n\n"
-                    f"[Context] model_size={model_size}, repo_id={repo_id}, cache_dir={redact_path(cache_dir)}"
+                    f"[Context] model_size={model_size}, repo_id={repo_id}, cache_dir={cache_dir}"
                 )
             
             kwargs = dict(
