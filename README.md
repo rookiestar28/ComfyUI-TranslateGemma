@@ -14,6 +14,16 @@ A ComfyUI integration for TranslateGemma — Google's open source translation mo
 
 <details>
 
+<summary><strong>Shared ComfyUI model roots supported</strong></summary>
+
+- Honors every path registered by ComfyUI for the exact `LLM` category, in host order.
+- Reuses the first complete snapshot of the requested model without copying it into the local instance.
+- Uses only the first registered/default `LLM` root for automatic download or resume when no complete snapshot exists.
+
+</details>
+
+<details>
+
 <summary><strong>Host compatibility and runtime safety improved</strong></summary>
 
 - Hardened remote-code and unsafe-weight opt-ins so ordinary load failures cannot silently widen trust.
@@ -172,14 +182,39 @@ Notes:
 
 ## Model Storage Location
 
-Models are stored under ComfyUI's models directory in a per-repo folder:
+Models use a per-repo folder under a ComfyUI `LLM` model root:
 
 - Preferred: `ComfyUI/models/LLM/TranslateGemma/<repo_name>/`
 - Fallback (legacy): `ComfyUI/models/translate_gemma/<repo_name>/`
+- Registered/shared root: `<registered LLM root>/TranslateGemma/<repo_name>/`
 
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-4b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-12b-it/`
 - `ComfyUI/models/LLM/TranslateGemma/translategemma-27b-it/`
+
+The node checks every path registered by ComfyUI for the exact `LLM` category in host order, then
+the built-in instance path and the legacy path. It reuses the first complete snapshot of the exact
+requested model. A model of another size or a partial snapshot does not stop the search, and files
+from different roots are never combined into one snapshot.
+
+If no complete snapshot exists, automatic download/resume uses the first registered `LLM` root. If
+the host has no registered `LLM` category, the existing preferred/legacy destination rule shown
+above applies. Mark the intended writable root as `is_default` in ComfyUI's extra model path
+configuration so the host places it first, for example:
+
+```yaml
+shared_models:
+  base_path: ../shared-models
+  is_default: true
+  LLM: LLM
+```
+
+Relative `base_path` values are resolved from the extra-model-path YAML file, so this example uses
+`../shared-models/LLM/TranslateGemma/<repo_name>/`. An absolute path is also supported by ComfyUI.
+Category names are case-sensitive; use `LLM`. Restart ComfyUI after changing its path configuration.
+If the first registered root is read-only, complete snapshots there can still be reused, but a
+missing/incomplete model cannot be downloaded or resumed there. The node will not silently write
+to another disk; choose a writable default root instead.
 
 ### Manual / Offline Download (Recommended for Restricted Networks)
 
@@ -189,8 +224,8 @@ regions where `huggingface.co` is blocked).
 
 **What to do:**
 
-1) On a machine that can access Hugging Face, download the **entire** model repo snapshot (all files).
-2) Copy the downloaded folder into your ComfyUI models path, for example:
+1) On a machine that can access Hugging Face, download the **entire** model repo snapshot (all files). Keep each snapshot together under one model root; the node does not combine files across roots.
+2) Copy the downloaded folder into your instance or registered/shared `LLM` path, for example:
 
 ```
 ComfyUI/
@@ -215,7 +250,7 @@ ComfyUI/
 
 Notes:
 - Gated models still require accepting the Gemma/TranslateGemma terms on Hugging Face (do this on the download machine).
-- If you copy an incomplete folder, the node may attempt to resume/download missing files when network allows.
+- An incomplete snapshot is not reused. Automatic recovery targets the first registered/default root; it resumes that folder only when the incomplete copy is already at that destination.
 - Pickle-backed `.bin` weights remain blocked unless `TRANSLATEGEMMA_ALLOW_UNSAFE_WEIGHTS=1` is explicitly set for a reviewed, pinned source. Prefer safetensors.
 
 ## Node: TranslateGemma
@@ -246,7 +281,7 @@ All established controls are visible when the node is created in Classic or Vue 
 | `truncate_input` | BOOLEAN | Truncate input if it exceeds `max_input_tokens`. Disable may cause OOM. Default: `true`. |
 | `strict_context_limit` | BOOLEAN | Clamp output so input+output stays within model context window. Default: `true`. |
 | `keep_model_loaded` | BOOLEAN | Keep model in memory for faster repeated use; may keep VRAM allocated. Default: `true`. |
-| `debug` | BOOLEAN | Enable debug logging. Sensitive data redacted by default; set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` for full details. Default: `false`. |
+| `debug` | BOOLEAN | Enable debug logging. Sensitive data is redacted by default. `TRANSLATEGEMMA_VERBOSE_DEBUG=1` enables local troubleshooting details that may include text or full paths. Default: `false`. |
 | `chinese_conversion_only` | BOOLEAN | OpenCC conversion only (Simplified↔Traditional) without loading the model. Text-only; image not supported. Default: `false`. |
 | `chinese_conversion_direction` | COMBO | `auto_flip` (detect and flip variant) / `to_traditional` (force s→t) / `to_simplified` (force t→s). Default: `auto_flip`. |
 | `long_text_strategy` | COMBO | `disable` (default single-call) / `auto-continue` (continue if model stops early) / `segmented` (paragraph-by-paragraph). Default: `disable`. |
@@ -412,16 +447,20 @@ If an unsupported language is passed, the node prints a warning and defaults to 
 
 ## Default Settings
 
-The following are the authoritative default values for node inputs:
+The following are the authoritative defaults for configurable widgets (link inputs are excluded):
 
 | Setting | Default | Notes |
 |---------|---------|-------|
+| `target_language` | `English` | Translation target |
+| `source_language` | `Auto Detect` | Text only; images require an explicit source language |
 | `model_size` | `4B` | Smallest, fastest |
 | `device` | `default` | Use ComfyUI's active device |
+| `prompt_mode` | `auto` | Structured first, then plain fallback |
 | `max_new_tokens` | `512` | Use `0` for auto-sizing |
 | `max_input_tokens` | `2048` | Input truncation limit (`0` = Auto) |
 | `keep_model_loaded` | `true` | Avoids reload overhead |
 | `truncate_input` | `true` | Prevents OOM on long texts |
+| `strict_context_limit` | `true` | Clamp output to the model context window |
 | `debug` | `false` | Enable for diagnostics |
 | `image_resize_mode` | `letterbox` | Preserves aspect ratio |
 | `image_enhance` | `false` | Enables contrast/sharpening |
@@ -529,12 +568,12 @@ Official upstream packages currently describe NVIDIA CUDA, AMD ROCm, Intel XPU, 
 ### Debug Privacy
 
 - By default, `debug=true` redacts sensitive data (user text content, full filesystem paths).
-- Set `TRANSLATEGEMMA_VERBOSE_DEBUG=1` to enable full diagnostics (for troubleshooting).
+- `TRANSLATEGEMMA_VERBOSE_DEBUG=1` may expose user text and full filesystem paths in console logs. Enable it only for temporary local troubleshooting, and sanitize logs before sharing them.
 
 ### Download Recovery
 
 - If a download is interrupted, the loader auto-resumes on next run.
-- If corruption persists, delete the model folder under `ComfyUI/models/LLM/TranslateGemma/` and retry.
+- If corruption persists, stop ComfyUI, verify the exact selected root, and back up or remove only the affected `<repo_name>` folder before retrying. Shared roots may be outside the ComfyUI directory; do not delete the entire `LLM` or `TranslateGemma` tree.
 
 ## License
 
